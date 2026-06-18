@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self' data: file: https://mcp.figma.com; img-src 'self' data: file: https://mcp.figma.com; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://mcp.figma.com;"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Notification Preview</title>
+    <link rel="stylesheet" crossorigin href="./out/renderer/assets/notification-DwruKXxw.css" />
+    <script src="https://mcp.figma.com/mcp/html-to-design/capture.js" async></script>
+    <script>
+      const search = new URLSearchParams(window.location.search);
+      const provider = search.get('provider') === 'proton' ? 'proton' : 'gmail';
+      const grouped = search.get('grouped') !== '0';
+      const iconUrl = new URL(provider === 'gmail' ? './build/gmail-notification.png' : './build/icon.png', window.location.href).toString();
+      const label = provider === 'gmail' ? 'Gmail' : 'Proton Mail';
+      const payload = {
+        id: 'preview',
+        provider,
+        accountId: provider === 'proton' ? 'primary' : null,
+        threadId: provider === 'gmail' ? 'preview-thread' : null,
+        title: grouped ? `2 new ${label.toLowerCase()} messages` : provider === 'gmail' ? 'Design feedback for V3' : 'Calendar invite updated',
+        sender: provider === 'gmail' ? 'Sarah Chen <sarah@example.com>' : 'Mira Patel <mira@example.com>',
+        subject: provider === 'gmail' ? 'Design feedback for V3' : 'Calendar invite updated',
+        snippet: grouped
+          ? 'Design feedback for V3  +1 more waiting'
+          : provider === 'gmail'
+            ? 'Looks great, let me know when the motion pass is ready.'
+            : 'The launch review moved to 4:30 PM. Updated notes are ready.',
+        footer: provider === 'gmail' ? 'Workspace inbox' : 'Mail account',
+        iconPath: provider === 'gmail' ? './build/gmail-notification.png' : './build/icon.png',
+        iconUrl,
+        soundUrl: new URL('./build/sound.mp3', window.location.href).toString(),
+        silent: true,
+        itemCount: grouped ? 2 : 1,
+        moreCount: grouped ? 1 : 0,
+        previews: grouped
+          ? [
+              {
+                sender: 'Sarah Chen <sarah@example.com>',
+                subject: 'Design feedback for V3',
+                snippet: 'Looks great, let me know when the motion pass is ready.',
+              },
+              {
+                sender: provider === 'gmail' ? 'Noah Kim <noah@example.com>' : 'Launch Ops <ops@example.com>',
+                subject: provider === 'gmail' ? 'Motion pass notes' : 'Release checklist',
+                snippet: provider === 'gmail' ? 'Sent over the revised transitions and hover timing.' : 'Final preflight checks are complete.',
+              },
+            ]
+          : [
+              {
+                sender: provider === 'gmail' ? 'Sarah Chen <sarah@example.com>' : 'Mira Patel <mira@example.com>',
+                subject: provider === 'gmail' ? 'Design feedback for V3' : 'Calendar invite updated',
+                snippet: provider === 'gmail'
+                  ? 'Looks great, let me know when the motion pass is ready.'
+                  : 'The launch review moved to 4:30 PM. Updated notes are ready.',
+              },
+            ],
+        actions: [
+          {
+            id: 'open',
+            title: provider === 'gmail' ? 'Open Gmail' : 'Open Proton Mail',
+            tone: 'primary',
+          },
+          ...(grouped ? [] : [{ id: provider === 'gmail' ? 'mark-read' : 'dismiss', title: provider === 'gmail' ? 'Mark read' : 'Dismiss', tone: 'default' }]),
+        ],
+      };
+
+      window.protonCompanion = {
+        notification: {
+          getCurrent: async () => payload,
+          act: async () => {},
+          dismiss: async () => {},
+        },
+      };
+    </script>
+    <script type="module" crossorigin src="./out/renderer/assets/notification-Co5-POuK.js"></script>
+  </head>
+  <body>
+    <div id="app"></div>
+  </body>
+</html>

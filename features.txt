@@ -1,0 +1,980 @@
+================================================================================
+MAILBRIDGE — COMPLETE FEATURE INVENTORY
+================================================================================
+Unified desktop email manager for Gmail + Proton Mail
+Built with: Electron 28, React 18, TypeScript 5, Vite 5, SQLite (better-sqlite3)
+================================================================================
+
+TABLE OF CONTENTS
+  1. PROJECT OVERVIEW & ARCHITECTURE
+  2. OAUTH CREDENTIALS & API KEYS
+  3. ELECTRON MAIN PROCESS FEATURES
+  4. PRELOAD/IPC BRIDGE FEATURES
+  5. RENDERER (UI) FEATURES
+  6. SHARED TYPES & CONSTANTS
+  7. DEPENDENCIES & BUILD CONFIG
+
+================================================================================
+1. PROJECT OVERVIEW & ARCHITECTURE
+================================================================================
+
+App Name: MailBridge
+Version: 1.0.0
+Description: Unified desktop email management for Gmail and Proton Mail
+License: MIT
+
+ARCHITECTURE LAYOUT:
+  src/
+    main/               — Electron main process (Node.js)
+      index.ts          — Entry point, app lifecycle, crash prevention
+      ipc/              — IPC handlers (accounts, gmail, proton, settings, etc.)
+      services/         — Backend services (storage DB, auth, sync, notifications)
+      windows/          — Window creation (main-window.ts)
+    preload/
+      index.ts          — contextBridge IPC API (exposed as window.mailbridge)
+    renderer/           — React UI (Chromium)
+      index.html
+      src/
+        main.tsx        — React entry point
+        App.tsx         — Root component with view routing
+        components/     — UI components organized by feature
+          common/       — Shared components (sidebar, titlebar, modals, etc.)
+          dashboard/    — Dashboard view
+          gmail/        — Gmail workspace (list, conversation, composer)
+          mail/         — Email composer with Tiptap editor
+          proton/       — Proton Mail embedded browser view
+          settings/     — Settings view
+        context/        — React context providers (Theme, Account)
+        hooks/          — Custom hooks (notifications, sync, multi-edit, etc.)
+        services/       — Renderer-side services (BIMI, sanitizer, folder mapping)
+        stores/         — State stores (message cache, selection, folder counts, sync)
+        styles/         — Global CSS with theme variables
+    shared/             — Code shared between main & renderer
+      types.ts          — All TypeScript interfaces
+      constants.ts      — App-wide constants
+      helpers.ts        — Utility functions
+      ipc.ts            — IPC channel names enum
+      notification.ts   — Notification data types
+
+BUILD SYSTEM:
+  - electron-vite (Vite-based Electron toolchain)
+  - 3 build targets: main, preload, renderer
+  - electron-builder for packaging (Windows NSIS installer)
+  - vitest for testing
+
+================================================================================
+2. OAUTH CREDENTIALS & API KEYS
+================================================================================
+
+GOOGLE GMAIL OAUTH 2.0 (hardcoded in src/main/services/gmail-auth.ts):
+  Client ID:     1059854407346-ukk1bltbkrmnqohognmmuf8ms76ff098.apps.googleusercontent.com
+  Client Secret: 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
+  Redirect URI:  http://localhost  (local callback server via random port)
+  Auth URL:      https://accounts.google.com/o/oauth2/v2/auth
+  Token URL:     https://oauth2.googleapis.com/token
+  Revoke URL:    https://oauth2.googleapis.com/revoke
+
+GMAIL OAUTH SCOPES REQUESTED:
+  - https://www.googleapis.com/auth/gmail.modify (read, send, trash, modify labels)
+  - https://www.googleapis.com/auth/gmail.labels  (manage custom labels)
+  - https://www.googleapis.com/auth/userinfo.email (identify user)
+  - https://www.googleapis.com/auth/userinfo.profile (get display name)
+
+OAUTH FLOW DETAILS:
+  - Uses PKCE (Proof Key for Code Exchange) with SHA-256 challenge
+  - Local ephemeral HTTP server listens on random port for callback
+  - System browser opens for Google sign-in
+  - exchangeCodeForTokens uses direct HTTP POST (not google-auth-library)
+  - Token refresh uses direct HTTP POST with fallback to google-auth-library
+  - refreshAccessTokenDirect() is primary; refreshAccessToken() is fallback
+  - Tokens encrypted with AES-256-GCM via encryptionService before storage
+  - Access tokens auto-refreshed when within 5 minutes of expiry
+  - Full recovery workflow: verifies credentials -> refreshes tokens -> validates API
+
+PROTON MAIL (no OAuth — uses embedded BrowserView):
+  Proton Mail URL:  https://mail.proton.me
+  Proton Account URL: https://account.proton.me
+  Session management via cookie persistence (proton-cookies.json)
+
+================================================================================
+3. ELECTRON MAIN PROCESS FEATURES
+================================================================================
+
+3.1 APP LIFECYCLE & WINDOW MANAGEMENT
+  - GPU acceleration disabled (avoids Windows renderer crashes)
+  - Chromium sandbox disabled
+  - Software rendering forced
+  - Autoplay policy set to 'no-user-gesture-required' (notification sounds)
+  - Frameless window with custom titlebar (frame: false, titleBarStyle: 'hidden')
+  - Window size: 1400x900 default, min 900x600
+  - Context isolation enabled, node integration disabled
+  - Renderer process crash handling: auto-reloads up to 2 times
+  - Window state broadcasts: maximize/unmaximize events sent to renderer
+  - macOS support: app stays open when all windows closed (window-all-closed handler)
+  - External link handling: all new windows open in system browser
+  - Clean shutdown: sync stops, Proton sessions destroyed on before-quit
+
+3.2 SQLITE STORAGE SERVICE (src/main/services/storage.ts)
+  Database: better-sqlite3, stored at app.getPath('userData')/mailbridge.db
+  Tables:
+    accounts — id, data (encrypted JSON), created_at, updated_at
+    settings — key/value pairs with timestamps
+    email_cache — account_id, message_id, thread_id, data, cached_at
+    app_logs — id, timestamp, level, message, context
+  WAL mode enabled, foreign keys enforced
+  Account data: stored encrypted via EncryptionService
+  Settings: merged with DEFAULT_SETTINGS on read
+  Cache: per-account message caching with retrieval by ID or bulk
+  Logging: persistent app logs with retention
+  Export/Import: full data export (encrypted JSON blob) and import
+  Generic key-value store: getKeyValue/setKeyValue/deleteKey
+
+3.3 ENCRYPTION SERVICE (src/main/services/encryption.ts)
+  Primary: Electron safeStorage (OS-level encryption tied to user account)
+  Fallback: AES-256-GCM with file-based key in .mailbridge-key
+  Encryption format prefix: 'ss:' for safeStorage, 'fk:' for file key
+  Backward compatibility with legacy format (no prefix)
+  Hash function using SHA-256
+  canDecrypt() method for validation before attempting decryption
+
+3.4 GMAIL AUTH SERVICE (src/main/services/gmail-auth.ts)
+  PKCE OAuth flow with code verifier + challenge
+  State parameter for CSRF protection
+  Local HTTP callback server on random available port
+  Duplicate account detection (same email across different account IDs)
+  Token exchange via direct HTTP POST
+  Token refresh: primary = direct HTTP POST, fallback = google-auth-library
+  Retry with exponential backoff (3 retries, base 1s delay)
+  Reauth error classification (GmailReauthRequiredError)
+  Full account recovery (verify -> refresh -> recreate -> validate)
+  Client reinitialization after errors
+  OAuth status broadcast to renderer during auth flow
+  Account validation (check token decryptability, expiry, refresh capability)
+  Token encryption before storage
+
+3.5 GMAIL API CLIENT (src/main/services/gmail-api-client.ts)
+  Direct HTTP fetch to gmail.googleapis.com (replaces google-auth-library wrapper)
+  Methods:
+    listThreads — with Gmail query syntax support
+    getThread — full thread with all messages parsed
+    modifyThread — add/remove labels
+    listLabels — all Gmail labels with counts
+    sendMessage — MIME multipart/alternative (text + HTML)
+    trashThread
+    deleteThreadPermanently
+    getMessage
+    getAttachment
+    getProfile
+    getUnreadSnapshot — unread count + latest unread thread summaries
+    healthCheck — lightweight profile API call
+  Thread summary cache with 30-second TTL
+  Concurrency limited metadata fetching (default 4 parallel)
+  Rate limiting with exponential backoff + jitter (max 4 retries)
+  Base64 decoding for email body parts (URL-safe variant)
+  MIME body parsing: collects HTML, text, and attachments from multipart emails
+  Thread-level operations (modify, trash, delete)
+
+3.6 GMAIL CONNECTION STATE MANAGER (src/main/services/gmail-connection-state.ts)
+  State machine per account: disconnected, initializing, initialized, ready, error, recovering
+  Global readiness signal
+  Per-account readiness promises
+  Automatic recovery with retry on failure
+  State change broadcasts to renderer via IPC
+  Validation and cleanup of stale/corrupted accounts
+  Health check with state update
+
+3.7 GMAIL ERROR CLASSIFICATION (src/main/services/gmail-errors.ts)
+  Error categories: reauth, transient, unknown
+  Reauth errors: invalid_grant, invalid_token, 401/403, expired/revoked tokens
+  Transient errors: rate limits (429), network errors, DNS, timeouts, 500/502/503
+  Custom error classes: GmailReauthRequiredError, GmailTransientError
+  Pattern matching for error message strings
+  Functions: isGmailQuotaError, isGmailReconnectError, isTransientGmailNetworkError
+
+3.7B GMAIL ERROR HELPERS (src/main/services/gmail-helpers.ts)
+  Re-exports from gmail-errors.ts for backwards compatibility
+  Dedicated functions:
+    isGmailQuotaError — regex check for quota/rate-limit error messages
+    isGmailPermanentDeleteReconnectMessage — detects "permanently delete Trash or Spam" error
+    isGmailReconnectError — checks instanceof GmailReauthRequiredError or classifyGmailError === 'reauth'
+    isTransientGmailNetworkError — checks classifyGmailError === 'transient'
+
+3.7C GMAIL API CLIENT UNIT TESTS (src/main/services/gmail-api-client.test.ts)
+  Framework: vitest with comprehensive mocks for gmail-auth, logger, gmail-errors, helpers
+  Test suites:
+    fetchJson — JSON parsing, 204 No Content, empty body, non-OK responses, error truncation (200 chars)
+    deleteThreadPermanently — DELETE request, 204 handling, API errors, reauth propagation
+    getAccessToken — token retrieval and error propagation
+    retryWithBackoff — first-attempt success, transient retry, reauth immediate throw, unknown immediate throw, max retries exhaustion
+    listThreads — empty results, query params, labelIds, combined query+labelIds, thread summary cache, metadata fetch fallback, transient retry
+    getThread — full thread with parsed messages, messages with no payload fallback
+    modifyThread — POST with addLabelIds/removeLabelIds, empty arrays, API errors
+    listLabels — parsed labels with system/user types and colors, empty array
+    sendMessage — MIME multipart/alternative format, CC/BCC headers, HTML stripping for plainText fallback, mailbridge.local domain
+    getUnreadSnapshot — unread count from inbox label, reauth propagation, network errors, 500 errors
+    trashThread — POST to trash endpoint
+    getProfile — profile data retrieval
+    healthCheck — health=true on success, health=false with error on failure
+    Cache management — invalidateAccountCache, invalidateAllCaches do not throw
+    getMessage — single message with full format
+    getAttachment — attachment by message+attachment id
+    Error classification — 429 as transient, 401 as reauth
+    mapWithConcurrency — limited concurrency, worker failure handling
+
+3.8 SYNC SERVICE (src/main/services/sync-service.ts)
+  Periodic auto-sync for all email accounts
+  Configurable interval (default 0.5 min, minimum 30 seconds)
+  Immediate initial sync on startup
+  Per-account unread count delta detection
+  Broadcasts sync status to renderer (started/completed/failed)
+  Gmail: fetches unread counts via labels API, detects new emails
+  Proton: updates last-synced timestamp (sync handled differently)
+  Locks to prevent overlapping sync cycles
+  Manual sync trigger (triggerManualSync function)
+
+3.9 NOTIFICATION SERVICE (src/main/services/notification-service.ts)
+  New email detection via sync events
+  Gmail: fetches latest unread threads, generates structured notifications
+  Proton: accepts notification data from BrowserView interception
+  Deduplication across restarts (persistent dedup store)
+  Dual delivery: native OS notifications + in-app toast events
+  Click-to-navigate (bring app to foreground, open conversation)
+  Per-account and per-provider notification controls
+  Test notification support
+  Notification sound playback via IPC to renderer
+  Configurable auto-dismiss duration
+  Batch processing for multiple new messages
+  Sender name/email extraction from headers
+
+3.10 NATIVE NOTIFICATION SYSTEM (src/main/services/native-notification.ts)
+  Wraps Electron's Notification API
+  Custom click handler: brings window to foreground, navigates to conversation
+  Tracks active notifications for cleanup
+  Silent mode (sound handled separately by renderer)
+
+3.11 NOTIFICATION DEDUPLICATION (src/main/services/notification-dedup.ts)
+  Persists seen notification IDs to SQLite (via storageService)
+  24-hour default TTL
+  Periodic eviction of stale entries (every 30 minutes)
+  Per-account cleanup on account removal
+  Full clear capability
+
+3.12 PROTON MAIL BROWSERVIEW SERVICE (src/main/services/proton-browser.ts)
+  Embedded Chromium BrowserView for Proton Mail access
+  Session isolation per account (persist:proton-{accountId} partition)
+  Cookie persistence (save/restore to disk for session continuity)
+  Custom user agent (Chrome 120 on Windows)
+  Error handling: did-fail-load, crashed, unresponsive, responsive
+  Notification shim injection on navigation (window.Notification override)
+  Login detection via URL matching (/inbox, /mail) and page title
+  BrowserView positioning with ResizeObserver-backed bounds tracking
+  Session destroy/refresh/show/hide operations
+  External link handling: allow Proton domains, deny others in system browser
+
+3.13 PROTON NOTIFICATION SHIM (src/main/services/proton-notification-shim.ts)
+  JavaScript injection into Proton BrowserView
+  Overrides window.Notification to intercept Proton's web notifications
+  Stores captured notifications in global __protonNotifications array
+  Flush helper to read and clear intercepted queue
+  Suppresses email notifications (consumes silently), passes others through
+  Sets permission to 'granted' always
+
+3.14 PROTON NOTIFICATION PARSER (src/main/services/proton-notification-parser.ts)
+  Parses Proton's free-form notification text
+  Handles formats: "From: Name\nSubject: Re: Hello", "Name - Subject", inline patterns
+  Extracts sender, subject, snippet
+  Filters generic/placeholder notifications
+  Sanitizes text (removes control characters, collapses whitespace)
+
+3.15 UNREAD COUNTER SERVICE (src/main/services/unread-counter.ts)
+  Aggregates unread counts across all accounts
+  Updates OS badge count (app.setBadgeCount)
+  Broadcasts badge updates to renderer
+  Per-account exclusion settings
+  Max display count (99+ formatting)
+  Incremental updates on message modifications
+  Formatted badge text (empty string for 0, "99+" for overflow)
+
+3.16 LOGGER (src/main/services/logger.ts)
+  File-based logging to userData/logs/mailbridge.log
+  Log levels: DEBUG, INFO, WARN, ERROR
+  Automatic log rotation at 5MB
+  Timestamped rotated log files
+  Console output in addition to file
+  Recent logs retrieval, log clearing
+  JSON context serialization
+
+3.17 ERROR REPORTER (src/main/services/error-reporter.ts)
+  Receives error reports from renderer and main process
+  Saves timestamped JSON files to userData/errors/
+  Consolidated JSONL error log
+  Log rotation at 5MB
+  File cleanup: max 500 files, 30-day retention
+  Error summary by source and level
+  Report listing and retrieval by ID
+  Clear all reports
+
+3.18 LINK VERIFICATION SERVICE (src/main/services/linkVerificationService.ts)
+  URL normalization and validation (protocol whitelist)
+  Trusted domain checking (Proton domains: *.proton.me, *.protonvpn.com, *.protonmail.com)
+  Dangerous protocol blocking (javascript:, vbscript:, data:, file:)
+  External link opening with verification
+  Open redirects to system browser via shell.openExternal
+  Logging for auditing
+
+3.19 IPC HANDLERS (src/main/ipc/)
+  accounts-handler.ts — CRUD for email accounts, set default
+  app-handler.ts — version, platform, open external, dialog confirm
+  gmail-handler.ts — full Gmail API operations through IPC
+  proton-handler.ts — BrowserView session management IPC
+  settings-handler.ts — get/update/reset settings
+  storage-handler.ts — cache management, export/import
+  unread-handler.ts — unread count retrieval and update
+  window-handler.ts — minimize/maximize/close window
+  register.ts — central registration of all handlers + service initialization
+
+3.20 IPC CHANNELS (src/shared/ipc.ts)
+  Full channel list with 60+ IPC endpoints:
+    auth:gmail:connect, auth:gmail:status, auth:gmail:refresh, auth:gmail:revoke, auth:gmail:reinit
+    gmail:health-check, gmail:get-profile, gmail:list-messages, gmail:get-message, gmail:get-thread
+    gmail:send-message, gmail:list-labels, gmail:modify-message, gmail:trash-message
+    gmail:delete-permanent, gmail:get-attachment, gmail:batch-get-messages
+    accounts:list, accounts:add, accounts:remove, accounts:update, accounts:set-default
+    proton:create-session, proton:refresh-session, proton:resize-session, proton:destroy-session
+    proton:hide-session, proton:get-session-path, proton:notify-login, proton:notify-logout
+    proton:is-logged-in, proton:status
+    settings:get, settings:update, settings:reset
+    storage:get-cache-size, storage:clear-cache, storage:export-data, storage:import-data
+    window:minimize, window:maximize, window:close, window:is-maximized
+    app:get-version, app:get-platform, app:open-external
+    unread:get-count, unread:badge-updated, unread:set-inbox-count
+    gmail:connection-state, gmail:ready
+    sync:status:started, sync:status:completed, sync:status:failed
+    dialog:confirm
+    notification:new-email, notification:get-preferences, notification:update-preferences
+    notification:sound-play, notification:get-sound-data, notification:open-conversation
+    notification:send-test
+    error:report
+
+3.21 WINDOW CRASH HANDLING (src/main/windows/main-window.ts)
+  render-process-gone event listener
+  Limited auto-reload (max 2 attempts)
+  Renderer crash prevention: GPU disabled, sandbox off, software rendering forced
+
+================================================================================
+4. PRELOAD/IPC BRIDGE FEATURES
+================================================================================
+
+4.1 PRELOAD SCRIPT (src/preload/index.ts)
+  Full type-safe IPC bridge via contextBridge.exposeInMainWorld('mailbridge', ...)
+  Exposed API includes ALL 60+ IPC channels as named methods
+  Push event listeners (on* pattern) with remove* cleanup functions
+  Event channels exposed:
+    onGmailConnectionState / removeGmailConnectionStateListener
+    onGmailReady / removeGmailReadyListener
+    onGmailAuthStatus / removeGmailAuthStatusListener
+    onProtonStatus / removeProtonStatusListener
+    onSyncStatusStarted/Completed/Failed / removeSyncStatus*Listener
+    onNewEmailNotification / removeNewEmailNotificationListener
+    onNotificationSoundPlay / removeNotificationSoundPlayListener
+    onNotificationOpenConversation / removeNotificationOpenConversationListener
+    onUnreadBadgeUpdate / removeUnreadBadgeListener
+    onMaximizedChanged / removeMaximizedChanged
+
+================================================================================
+5. RENDERER (UI) FEATURES
+================================================================================
+
+5.1 REACT ENTRY POINT (src/renderer/src/main.tsx)
+  Error boundary at root level
+  ThemeProvider + AccountProvider wrapping App
+  Renderer error reporter initialization (initErrorReporter)
+  Fatal error handling with HTML fallback (no React)
+
+5.2 ERROR REPORTER (RENDERER) (src/renderer/src/services/errorReporter.ts)
+  Catches: unhandledrejection, uncaught errors, console.error
+  Event prevention: prevents default browser handlers (ResizeObserver loop handled)
+  Circular reference-safe JSON.stringify for console.error interception
+  Sends structured error reports to main process via IPC
+  Component stack tracking for React errors
+
+5.3 MAIN APP COMPONENT (src/renderer/src/App.tsx)
+  3 view modes: dashboard, workspace, settings
+  Account switching with Gmail/Proton routing
+  Unified Mail view (aggregate all Gmail accounts)
+  Notification navigation: click notification -> navigate to workspace
+  Persistent sidebar + titlebar layout
+  Add Account modal trigger
+  Provider-aware workspace rendering (GmailWorkspace vs ProtonView)
+  Last Gmail account tracking for Proton back-navigation
+
+5.4 TITLEBAR (src/renderer/src/components/common/TitleBar.tsx)
+  Custom frameless titlebar with drag region
+  App icon + name display
+  Unread badge count (with 99+ formatting)
+  Active view label
+  Navigation buttons: Dashboard, Settings
+  Window controls: Minimize, Maximize/Restore, Close
+  Maximized state tracking
+
+5.5 CONTEXT MENU (src/renderer/src/components/common/ContextMenu.tsx)
+  Reusable right-click context menu with glassmorphism styling
+  ContextMenuItemDef interface: id, label, icon (ReactNode), onClick, disabled, separator, danger
+  Viewport boundary clamping (prevents overflow)
+  Keyboard navigation: ArrowUp/ArrowDown to focus, Enter to activate, Escape to close
+  Mouse hover focus tracking
+  Click-outside auto-dismiss (with 10ms delay to avoid immediate close from right-click)
+  Smooth context-menu-enter animation (scale 0.95 -> 1, fade in)
+  Danger items rendered in red (#ef4444)
+  Disabled items with reduced opacity and default cursor
+  Separator lines between menu sections
+  Accessible: role="menu", role="menuitem", tabIndex
+
+5.6 DRAGGABLE DIVIDER (src/renderer/src/components/common/DraggableDivider.tsx)
+  Thin interactive divider between resizable panels
+  Orientation: vertical (column) or horizontal (row)
+  Continuous resize callback (onResize with delta px)
+  onResizeStart/onResizeEnd lifecycle callbacks
+  Stale-closure-safe via useRef for all callbacks
+  Global mouse events (mousemove/mouseup on window)
+  Body cursor switch (col-resize/row-resize) and userSelect none during drag
+  Visual handle line with hover highlight (accent color + scaleX 1.5)
+  Transparent hit area (6px) with 3px negative margin overlap on both sides
+  150ms transition on handle background and transform
+
+5.7 EXTERNAL LINK MODAL (src/renderer/src/components/common/ExternalLinkModal.tsx)
+  Confirmation dialog when user clicks external link in email
+  Inspired by Proton Mail's external-link-confirmation system
+  Warning icon with amber color
+  Displays destination hostname in uppercase with warning color
+  Full URL display with word-break and monospace font
+  URL truncation at 120 characters
+  Copy URL button with clipboard API
+    Success state: green checkmark + "Copied" (auto-reset 1200ms)
+    Failure state: red X + "Failed" (auto-reset 1200ms)
+  "Only follow links from senders you trust" hint text
+  Actions: Copy, Cancel, Visit Link (gradient button)
+  Keyboard shortcuts: Escape=cancel, Enter=confirm
+  Backdrop click to cancel (e.stopPropagation on modal body)
+  fadeIn backdrop + scaleIn modal entrance animations
+  All buttons with hover effects (background, box-shadow, translateY)
+
+5.8 SYNC STATUS INDICATOR (src/renderer/src/components/common/SyncStatusIndicator.tsx)
+  Always-mounted pill (never conditionally null) — uses opacity/transform for transitions
+  States: syncing (accent color + spinning icon), updated (green + checkmark), idle/faded (tertiary color)
+  Fade-in on mount via requestAnimationFrame
+  Pulse animation on syncing status (syncPulse keyframe, 2s infinite)
+  Spinning sync icon (syncSpin keyframe, 1s linear infinite)
+  Relative time display ("now", "5s", "3m", "2h") with tabular-nums
+  Updated state visible with green styling for 3 seconds
+  Faded mode at 0.4 opacity (hover hidden, pointerEvents none for 30s idle)
+  Tooltip on hover: status message, detail text, last-updated timestamp
+  prefers-reduced-motion: disables animations
+  Accessible: role="status", aria-live="polite", aria-label
+
+5.9 NOTIFICATION STACK (src/renderer/src/components/common/NotificationStack.tsx)
+  Fixed-position overlay in top-right corner (top:60, right:16)
+  Stacks notification toasts vertically with smooth enter/exit transitions
+  Queue visibility: opacity + translateY transition, pointerEvents disabled when empty
+  History button: always visible, opens notification history panel
+  Dismiss All button: only when 2+ notifications, shows count
+  Each toast wrapped in pointerEvents:auto div for clickability
+  Accessible: role="region", aria-label="Notifications", aria-hidden when empty
+
+5.10 NOTIFICATION TOAST (src/renderer/src/components/common/NotificationToast.tsx)
+  Premium dark card design matching target spec
+  Layout: left accent bar (4px, gradient) | content area
+  Top row: Circular avatar with colored ring + sender email (uppercase, muted) + time
+  Subject line with quotation marks, bold white 14px
+  Preview/snippet line (conditionally shown based on showPreviews setting)
+  Bottom row: Account provider badge (GMAIL in purple / PROTON) + action buttons
+  Actions: "Open Unified Inbox" gradient button (hover glow) + "Mark read" ghost button
+  Animated progress bar at bottom for auto-dismiss timer (updates every 50ms)
+  Slide-in animation from right (translateX 120%->0, scale 0.9->1)
+  Dismissed state: slide out + fade
+  Hover state tracking for button styling
+  formatTime helper: relative times (now, Xm, Xh, or HH:MM)
+  Accessible: role="alert", aria-live="polite"
+
+5.11 SIDEBAR (src/renderer/src/components/common/Sidebar.tsx)
+  Gmail accounts section with collapsible dropdown
+  Proton accounts section with collapsible dropdown
+  Account items with unread badges
+  Unified Mail option (when 2+ Gmail accounts)
+  Proton hover actions: Refresh, Logout
+  Settings button at bottom
+  Add Account button
+  Empty state when no accounts
+  Dashboard navigation
+
+5.12 DASHBOARD (src/renderer/src/components/dashboard/Dashboard.tsx)
+  Time-based greeting (morning/afternoon/evening)
+  Stats overview cards: Total Accounts, Unread, Gmail Count, Proton Count
+  Account list cards with provider icons and unread badges
+  Quick Actions buttons (one per Gmail account to open inbox)
+  Empty state with add-account call-to-action
+
+5.13 GMAIL VIEW WRAPPER (src/renderer/src/components/gmail/GmailView.tsx)
+  Thin wrapper around GmailWorkspace for single-account mode
+  Empty state when no accountId provided (mail icon + "No Gmail account selected" prompt)
+  Account-not-found state with message
+  Passes account as single-element array to GmailWorkspace
+
+5.14 GMAIL WORKSPACE (src/renderer/src/components/gmail/GmailWorkspace.tsx)
+  Three-panel layout: sidebar | email list | conversation view
+  Unified mode: aggregate messages across multiple Gmail accounts
+  Folder switching with scroll position + selection preservation
+  Optimistic UI updates (no full reload after actions)
+  Background incremental sync every 30 seconds
+  Auto-mark selected unread messages as read (300ms delay)
+  Bulk actions: mark read/unread, star/unstar, archive, delete, spam, permanent delete
+  Disconnected account banners with reconnect buttons
+  Keyboard shortcuts: Ctrl+E (multi-edit), Delete (trash)
+  Search with query passthrough to Gmail API
+  Responsive breakpoint at 900px (narrow mode: hide list panel when conversation open)
+  Resizable panels via DraggableDivider (persistent ratio in localStorage)
+  Context menu on email cards (right-click)
+  Composer integration (Reply, Forward, New message)
+  Connection state listeners (disconnected/error/ready)
+  Retry with Gmail reinitialization
+  Folder counts fetched from labels API
+  User-created Gmail labels as navigable folders
+
+5.15 GMAIL SIDEBAR (src/renderer/src/components/gmail/GmailSidebar.tsx)
+  180px wide folder navigation
+  System folders: Inbox, Unread, Starred, Drafts, Sent, Trash, Spam, Archive
+  User-created labels section with separator
+  Account header with avatar initial + name + email
+  Folder counts display (total + unread) with animated badges
+  Active folder highlight with gradient background
+  "Connected via API" footer
+
+5.16 GMAIL HEADER (src/renderer/src/components/gmail/GmailHeader.tsx)
+  Three-section layout: left (folder), center (search), right (actions)
+  Folder name + message count
+  Edit/Multi-select toggle button
+  Refresh button
+  Sync status indicator integration
+  Search input (max 400px, centered)
+  Compose button (primary gradient)
+  Overflow menu: Select all, Mark all as read
+  Search text input
+
+5.17 EMAIL LIST (src/renderer/src/components/gmail/EmailList.tsx)
+  Virtual-scrolled email card list (46px item height)
+  Overscan of 15 items for smooth scrolling
+  Multi-edit mode with click/shift-click/ctrl-click selection
+  Scroll restoration per folder
+  Skeleton loading overlay (8 skeleton items with opacity gradient)
+  Error states: connection errors, initializing, recovering, disconnected
+    - Each error variant has icon + title + retry label
+  Empty state: "No messages" or "No messages match your search"
+  Context menu on each card
+  Card features:
+    - Unread dot with glow animation + fade-out transition
+    - Sender name + subject + time
+    - Star indicator (yellow filled star)
+    - Avatar display with brand logo
+    - Account source badge (for unified view)
+    - Attachment indicator
+    - Hover effects (translateX, border color)
+    - Selected/checked highlight styling
+  Memory-optimized: stable visibleItems array, memoized card components, custom comparator
+
+5.18 CONVERSATION VIEW (src/renderer/src/components/gmail/ConversationView.tsx)
+  Message detail loading (with parent's cached loader, deduplication)
+  Action toolbar: Back, Reply, Forward, Star, Archive, Delete
+  Full email header collapsible section (EmailHeaderDetails)
+  Attachment grid display
+  Email body rendered in isolated iframe (EmailRenderer)
+  Loading state with skeleton placeholders
+  Error state
+  Placeholder when no message selected
+  Body parsing with MIME part traversal
+
+5.19 EMAIL RENDERER (src/renderer/src/components/gmail/EmailRenderer.tsx)
+  iframe-isolated rendering with sandbox="allow-same-origin"
+  srcdoc/contentDocument for complete CSS isolation
+  DOMPurify HTML sanitization before insertion
+  Plain text to monospace HTML conversion
+  Auto-resize iframe height via ResizeObserver
+  External link interception with confirmation modal
+  Multiple fallback paths for body extraction
+
+5.20 EMAIL HEADER DETAILS (src/renderer/src/components/gmail/EmailHeaderDetails.tsx)
+  Collapsible header metadata section
+  Always visible: sender avatar, name, recipients, date
+  Expandable: From, To, Cc, Bcc, Date, Reply-To, Subject
+  Smooth grid-template-rows height animation
+  Accessible: aria-expanded, keyboard navigation
+
+5.21 ATTACHMENT GRID (src/renderer/src/components/gmail/AttachmentGrid.tsx)
+  Responsive grid of attachment cards (auto-fill, min 140px)
+  File type detection with custom SVG icons per extension
+  Supported types: pdf, png/jpg/jpeg/gif/svg, txt, xlsx/xls/csv, zip/rar/7z, mp4/mov/avi, mp3/wav, doc/docx, ppt/pptx
+  Extension badge on preview area
+  File download via Blob URL
+  Download progress indicator (opacity)
+  Hover effects (border color, translateY)
+
+5.22 BULK ACTION BAR (src/renderer/src/components/gmail/BulkActionBar.tsx)
+  Floating bottom bar when messages selected
+  Action buttons: Mark Read, Mark Unread, Star, Unstar, Archive, Delete, Spam
+  Conditional buttons: Delete Forever (in Trash/Spam), Move to Folder, Apply Label, Restore
+  Selection count display
+  Animated enter/exit
+  Hover effects on action buttons
+
+5.23 EMAIL COMPOSER (src/renderer/src/components/mail/Composer.tsx)
+  Tiptap rich text editor (Prosemirror-based)
+  Features:
+    - Rich text: bold, italic, underline
+    - Lists: bullet, numbered
+    - Links (with URL prompt)
+    - Images (with URL prompt)
+    - Headings (h1, h2, h3)
+    - Blockquotes
+    - Undo/Redo
+  Header fields: From (selectable per Gmail account), To, Cc, Bcc, Subject
+  File attachments (local file picker)
+  Draft autosave to localStorage (1.5s debounce)
+  Send via Ctrl+Enter / Cmd+Enter
+  MIME multipart/alternative email (text + HTML)
+  Discard with draft cleanup
+  Loading/sending states with spinner
+  Error display
+
+5.24 EDITOR TOOLBAR (src/renderer/src/components/mail/EditorToolbar.tsx)
+  Toolbar groups separated by dividers
+  Group 1: Bold, Italic, Underline
+  Group 2: Bullet List, Numbered List
+  Group 3: Link, Image
+  Group 4: Undo, Redo
+  Active state highlighting
+  Tiptap integration
+
+5.25 PROTON VIEW (src/renderer/src/components/proton/ProtonView.tsx)
+  Embedded BrowserView container (Electron BrowserView rendered by main process)
+  Auto-launch session on view activation
+  Loading overlay with skeleton
+  Error overlay: crash detection, retry button
+  Unresponsive overlay: Reload or Wait options
+  Session state tracking: idle, loading, active, error, crashed, unresponsive
+  ResizeObserver-based bounds tracking (sidebar-aware positioning)
+  Floating Refresh button (hover-visible, low opacity)
+  Proton auth status listener
+  Back to Gmail navigation footer
+  Placeholder: "Proton Mail browser view active"
+
+5.26 SETTINGS VIEW (src/renderer/src/components/settings/SettingsView.tsx)
+  Sidebar with 7 sections:
+    General — Launch on startup, Minimize to tray, Open to dashboard, Default account
+    Appearance — Theme (light/dark/system), Accent color picker (7 colors)
+    Accounts — List all accounts with provider icon, Remove button
+    Notifications — Enable, Sound, Previews, Notify for (Gmail/Proton), Auto-dismiss duration (3s-until-dismissed), Do Not Disturb, Click behavior (open-message/open-inbox)
+        Test Notification button with status feedback
+        Notification History panel with expandable list
+    Sync — Auto-sync, Sync on startup, Sync interval (1min-1hour)
+    Browser — Clear session on exit, Block third-party cookies
+    Data & Cache — Cached data size display, Clear Cache, Auto-clean, Cache clean interval, Export Data, Import Data
+  All settings saved via IPC to main process
+  Toggle switches (custom styled)
+  Select dropdowns with options
+
+5.27 ADD ACCOUNT MODAL (src/renderer/src/components/common/AddAccountModal.tsx)
+  Provider selection: Gmail or Proton
+  Gmail flow: system browser OAuth (no name form — auto-named from Google profile)
+  Proton flow: email + optional name inputs
+  OAuth status feedback: "Opening browser", "Authenticated ✓", error states
+  Color assignment from ACCOUNT_COLORS palette
+  Duplicate account detection
+  Back/Retry navigation
+
+5.28 AVATAR DISPLAY (src/renderer/src/components/common/AvatarDisplay.tsx)
+  Multi-step logo resolution:
+    1. BrandLogoService (IndexedDB-cached, BIMI -> Favicon -> Initials)
+    2. Initials on deterministic gradient background
+  Shared in-memory LRU logo cache (500 entries, eviction via LRU)
+  Loading state with pulse animation
+  SVG support (contain fit) vs raster (cover fit)
+  Size-responsive border radius (small=8px, large=12px)
+
+5.29 BRAND LOGO SERVICE (src/renderer/src/services/brandLogoService.ts)
+  Smart logo resolution pipeline: BIMI DNS -> BIMI SVG -> Google Favicons -> Direct favicon.ico -> None
+  Persistent caching: IndexedDB + in-memory LRU (200 entries)
+  30-day TTL for successful fetches, 1-day for failures
+  Exponential backoff on failure (base 1h, max 5 retries)
+  Thumbnail generation (64px PNG via canvas)
+  Concurrency-limited fetching (max 6 parallel)
+  Preloading support for batch domain resolution
+  Cache diagnostics and stats
+  Orphan pruning
+  ETag/content hash for change detection
+
+5.30 BIMI SERVICE (src/renderer/src/services/bimi.ts)
+  DNS-over-HTTPS query via dns.google for BIMI TXT record (default._bimi.<domain>)
+  SVG validation: max 32KB, no scripts/event handlers, proper SVG/XML start
+  SVG to base64 data URL conversion
+  Favicon fallback: Google favicons service (s2/favicons) + direct favicon.ico
+  Deterministic avatar gradient palette (8 gradients)
+  Initials extraction from email headers
+
+5.31 EMAIL SANITIZER (src/renderer/src/services/emailSanitizer.ts)
+  DOMPurify-based HTML sanitization
+  Comprehensive allowed tags list (email-safe HTML)
+  Comprehensive allowed attributes
+  Protocol safety: allows http, https, mailto, tel, sms, ftp, ftps
+  Strips: javascript:, data:, vbscript: URLs
+  Plain text to HTML conversion with monospace <pre>
+  HTML content detection via tag pattern matching
+
+5.32 GMAIL FOLDER SERVICE (src/renderer/src/services/gmailFolderService.ts)
+  System folder definitions with Gmail API label IDs and queries
+  Folder query builder for Gmail API (labelIds + query string)
+  Action label changes: archive, moveToInbox, markRead, markUnread, star, unstar, spam, unspam
+  Move label changes between folders
+  User-created Gmail label extraction from API response
+  Folder count computation from Gmail labels data
+  Incremental label update helpers
+  Affected folder count tracking per action
+
+5.33 THEME CONTEXT (src/renderer/src/context/ThemeContext.tsx)
+  Theme modes: light, dark, system
+  Accent color customization with 7 preset colors
+  Dynamic CSS variable application (--accent, --accent-hover, --accent-muted, --accent-glow)
+  System theme change listener (prefers-color-scheme)
+  Settings persistence via IPC
+  Color adjustment utility (lighten/darken hex colors)
+
+5.34 ACCOUNT CONTEXT (src/renderer/src/context/AccountContext.tsx)
+  Account state management
+  CRUD operations via IPC
+  Default account tracking
+  Account ID generation (provider-timestamp-counter)
+
+5.35 NOTIFICATIONS HOOK (src/renderer/src/hooks/useNotifications.ts)
+  Push event listener for new email notifications
+  Notification queue management (max 5 visible)
+  Auto-dismiss timer per notification
+  History tracking (max 100 entries, with dismiss source + timestamps)
+  Notification sound playback via Web Audio API
+  Sound file loading: fetches base64 MP3 from main process, decodes to AudioBuffer
+  AudioContext lazy initialization (avoids Windows crash from audio driver issues)
+  Fallback beep generation (oscillator, A5 note, 250ms)
+  Native notification click -> conversation navigation
+  Preference syncing
+
+5.36 SYNC STATUS HOOK (src/renderer/src/hooks/useSyncStatus.ts)
+  Sync state machine: idle -> syncing -> updated -> dimmed -> idle
+  Debounce (300ms) before showing syncing state
+  Updated state visible for 3 seconds
+  Dimmed state (faded) for 30 seconds before full idle
+  Relative time display ("now", "5s", "3m", "2h")
+  Listens to main process sync status events
+  Helper: trackSync() wraps async operations with status updates
+
+5.37 UNREAD BADGE HOOK (src/renderer/src/hooks/useUnreadBadge.ts)
+  Listens for push badge updates from main process
+  Initial fetch on mount
+  Badge text formatting (99+ overflow)
+  Per-account unread counts
+  Refresh function
+
+5.38 MULTI-EDIT HOOK (src/renderer/src/hooks/useMultiEdit.ts)
+  Multi-edit mode toggle
+  Selected IDs set management
+  Shift-click range selection
+  Ctrl+Click toggle selection
+  Select all / Clear
+  Enter multi-edit with initial selection
+
+5.39 DRAFT AUTOSAVE HOOK (src/renderer/src/hooks/useDraftAutosave.ts)
+  localStorage-based draft storage (per account)
+  1.5 second debounce
+  Save/Load/Clear operations
+  Full DraftData type (accountId, from, to, cc, bcc, subject, bodyHtml, attachments)
+
+5.40 EMAIL CONTEXT MENU ACTIONS (src/renderer/src/hooks/emailContextMenuActions.tsx)
+  Right-click context menu builder for email cards
+  Actions: Mark Read/Unread, Star/Unstar, Reply, Archive, Delete, Delete Forever, Spam
+  BIMI diagnostics: Fetch BIMI Logo, Retry Logo Resolution
+  Multi-Edit entry
+  Confirmation dialogs for destructive actions
+  Separators between action groups
+
+5.41 MESSAGE STORE (src/renderer/src/stores/messageStore.ts)
+  Renderer-side cache for folder message contents
+  Scoped subscriptions (key-prefix based — only re-render relevant components)
+  Change detection via version counter
+  localStorage persistence for cold-start restoration (5-min stale detection)
+  Background (deferred) pending cache for silent refreshes
+  Cache limits: 200 entries max, 10-minute TTL, lazy eviction
+  Operations: setFolderMessages, updateMessage, removeMessage, upsertMessages, prependMessages
+  Optimistic update support
+
+5.42 SELECTION STORE (src/renderer/src/stores/selectionStore.ts)
+  Per-folder selected message ID + scroll position preservation
+  Data generation tracking (detect list rebuilds)
+  Save/Restore state on folder switch
+  Subscription for reactive updates
+
+5.43 SYNC ENGINE (src/renderer/src/stores/syncEngine.ts)
+  Orchestrates folder content synchronization
+  Request token deduplication (prevents race conditions)
+  Concurrency-limited account operations (max 4 parallel)
+  Background refresh support (suppresses loading spinners)
+  Incremental sync with cooldown (30s between)
+  Single account and unified mode support
+  Cache freshness check (60-second threshold)
+
+5.44 FOLDER COUNT STORE (src/renderer/src/stores/folderCountStore.ts)
+  Live folder counts from Gmail labels API
+  Scoped subscriptions per account
+  Debounced notifications (16ms — one animation frame)
+  Throttled API fetches (max 3 concurrent)
+  Incremental count adjustment
+  Bulk count setting from labels API response
+  User label count computation
+
+5.45 GMAIL LABEL STORE (src/renderer/src/stores/gmailLabelStore.ts)
+  Gmail label metadata management
+  Deduplicated fetches
+  Staleness detection (5-minute TTL)
+  User label extraction and caching
+  Reactive subscriptions
+
+5.46 GLOBAL CSS (src/renderer/src/styles/global.css)
+  CSS custom properties for glassmorphism theme
+  Dark theme (default) + Light theme overrides
+  Base reset (box-sizing, margin)
+  Scrollbar styling (thin, themed)
+  Glass card utility classes
+  Button base + primary + ghost + icon + small variants
+  Input base with focus states
+  Badge utility classes
+  Layout helpers (app-layout, app-body)
+  Animation keyframes:
+    fadeIn, slideInRight, slideInUp, pulse, shimmer, scaleIn
+    syncSpin, syncPulse, bulk-bar-enter, bulk-bar-exit
+    context-menu-enter, avatar-pulse, skeletonFadeIn
+    unreadDotPulse, unreadDotFadeIn, unreadDotFadeOut
+    badgeFadeIn, badgeScaleIn, spin
+  Accessibility: prefers-reduced-motion reduction
+  Utility classes: truncate, flex-center, flex-between, spacing, font, text color
+
+5.47 GMAIL WORKSPACE HELPERS (src/renderer/src/components/gmail/gmailWorkspaceHelpers.ts)
+  getMessageBodyPreview — extracts plain text preview from message payload
+  buildAccountEmailMap — creates email lookup map for unified view
+  aggregateMessages — merges messages from multiple accounts sorted by date
+  aggregateFolderCounts — merges folder counts from multiple accounts
+  findNearestVisibleId — selection preservation when messages refresh
+
+5.48 DIAGNOSTIC MODE (src/renderer/src/diagnostic.tsx)
+  Minimal React render test (no app components)
+  Purpose: isolate whether React itself causes renderer crashes
+  Loaded manually, not part of normal app flow
+
+================================================================================
+6. SHARED TYPES & CONSTANTS
+================================================================================
+
+6.1 SHARED TYPES (src/shared/types.ts)
+  Account types: EmailAccount, GmailAccount, ProtonAccount, MailAccount (union)
+  Provider enum: 'gmail' | 'proton'
+  Gmail types: GmailLabel, GmailMessage, GmailThread, EmailMessage
+  Proton types: ProtonSession
+  Settings types: AppSettings, ThemeMode ('light' | 'dark' | 'system')
+  Full IpcChannels interface with typed request/response pairs
+  Auth status types: GmailAuthStatus, ProtonAuthStatus
+  Email structure: headers, parts, attachments, MIME body
+  Contact fields: from, to, cc, bcc (each with name + address)
+
+6.2 SHARED CONSTANTS (src/shared/constants.ts)
+  APP_NAME = 'MailBridge'
+  APP_VERSION = '1.0.0'
+  GMAIL_SCOPES — 4 OAuth scopes
+  GMAIL_AUTH_URL, GMAIL_TOKEN_URL, GMAIL_REVOKE_URL
+  PROTON_MAIL_URL, PROTON_ACCOUNT_URL
+  ACCOUNT_COLORS — 8 colors (indigo, blue, cyan, emerald, amber, red, pink, violet)
+  MAX_MESSAGE_BODY_SIZE = 50MB
+  DEFAULT_SYNC_INTERVAL = 15 seconds
+  TOKEN_REFRESH_BUFFER = 5 minutes
+  DB_NAME, SETTINGS_KEY, ACCOUNTS_STORE, CACHE_STORE, LOG_STORE
+
+6.3 SHARED HELPERS (src/shared/helpers.ts)
+  decodeBase64 — URL-safe variant support
+  formatFileSize — human-readable (B, KB, MB, GB)
+
+6.4 NOTIFICATION TYPES (src/shared/notification.ts)
+  NewEmailNotification — full notification data structure
+  NotificationPreferences — user preferences structure
+  NotificationEvent — type + payload
+
+================================================================================
+7. DEPENDENCIES & BUILD CONFIG
+================================================================================
+
+DEPENDENCIES (package.json):
+  Runtime:
+    @tiptap/extension-image ^3.26.1
+    @tiptap/extension-link ^3.26.1
+    @tiptap/extension-placeholder ^3.26.1
+    @tiptap/extension-underline ^3.26.1
+    @tiptap/pm ^3.26.1
+    @tiptap/react ^3.26.1
+    @tiptap/starter-kit ^3.26.1
+    better-sqlite3 ^11.0.0
+    dompurify ^3.4.11
+    google-auth-library ^9.0.0
+    googleapis ^134.0.0
+    react ^18.2.0
+    react-dom ^18.2.0
+
+  Dev:
+    @types/better-sqlite3 ^7.6.0
+    @types/dompurify ^3.0.5
+    @types/node ^20.0.0
+    @types/react ^18.2.0
+    @types/react-dom ^18.2.0
+    @vitejs/plugin-react ^4.2.0
+    electron ^28.0.0
+    electron-builder ^26.15.3
+    electron-vite ^2.0.0
+    typescript ^5.3.0
+    vite ^5.0.0
+    vitest ^4.1.9
+
+BUILD SCRIPTS:
+  dev — electron-vite dev
+  build — electron-vite build
+  preview — electron-vite preview
+  typecheck:node — tsc --noEmit tsconfig.node.json
+  typecheck:web — tsc --noEmit tsconfig.web.json
+  typecheck — both node + web
+  start — electron-vite preview
+  pack — electron-vite build && electron-builder --win --dir
+  dist — electron-vite build && electron-builder --win
+
+BUILD CONFIG (electron-builder):
+  App ID: com.mailbridge.app
+  Product name: MailBridge
+  Output: dist/
+  Windows target: NSIS installer (x64)
+  NSIS: one-click off, per-machine off, allow custom install dir, desktop shortcut
+  asarUnpack: better-sqlite3 native module
+  Extra resources: resources/ folder
+
+VSCODE WORKSPACE ALIASES:
+  @ -> src/renderer/src/
+  @shared -> src/shared/
+
+TEST CONFIG (vitest):
+  Globals enabled
+  Node environment
+  Test files: src/main/services/**/*.test.ts
+  15-second timeout
+  @shared alias configured
+
+================================================================================
+END OF FEATURE INVENTORY
+================================================================================

@@ -1,0 +1,34 @@
+appId: com.mailbridge.app
+productName: MailBridge
+directories:
+  output: dist
+  buildResources: resources
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.eslintignore,.eslintrc.cjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: ${name}-${version}-setup.${ext}
+  icon: icon.ico
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  installerIcon: icon.ico
+  uninstallerIcon: icon.ico
+extraResources:
+  - from: resources
+    to: '.'
+    filter:
+      - '**/*'
+asarUnpack:
+  - '**/*.node'
+  - '**/*.wasm'
+  - node_modules/sql.js/dist/sql-wasm.wasm
