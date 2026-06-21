@@ -105,6 +105,14 @@ const mailbridge = {
     const handler = (_event: any, data: any) => callback(data)
     ipcRenderer.on('window:maximized-changed', handler)
     return () => ipcRenderer.removeListener('window:maximized-changed', handler)
+  },
+
+  // External link confirmation
+  externalLinkResult: (confirmed: boolean) => ipcRenderer.send(IpcChannels.EXTERNAL_LINK_RESULT, confirmed),
+  onExternalLinkConfirm: (callback: (url: string) => void) => {
+    const handler = (_event: any, url: string) => callback(url)
+    ipcRenderer.on(IpcChannels.EXTERNAL_LINK_CONFIRM, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.EXTERNAL_LINK_CONFIRM, handler)
   }
 }
 

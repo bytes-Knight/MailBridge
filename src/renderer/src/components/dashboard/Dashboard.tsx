@@ -20,13 +20,13 @@ export function Dashboard({ onSelectAccount, onAddAccount }: DashboardProps): Re
 
   return (
     <div className="dashboard">
-      <div className="dashboard-greeting">
+      <div className="dashboard-greeting view-enter">
         <h1>{greeting}</h1>
         <p>Welcome to MailBridge</p>
       </div>
 
-      <div className="dashboard-stats">
-        <div className="dashboard-stat-card">
+      <div className="dashboard-stats stagger-enter">
+        <div className="dashboard-stat-card hover-lift">
           <div className="dashboard-stat-icon" style={{ background: 'rgba(99,102,241,0.15)' }}>
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2">
               <rect x="2" y="4" width="20" height="16" rx="2" />
@@ -39,7 +39,7 @@ export function Dashboard({ onSelectAccount, onAddAccount }: DashboardProps): Re
           </div>
         </div>
 
-        <div className="dashboard-stat-card">
+        <div className="dashboard-stat-card hover-lift">
           <div className="dashboard-stat-icon" style={{ background: 'rgba(239,68,68,0.15)' }}>
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2">
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
@@ -51,7 +51,7 @@ export function Dashboard({ onSelectAccount, onAddAccount }: DashboardProps): Re
           </div>
         </div>
 
-        <div className="dashboard-stat-card">
+        <div className="dashboard-stat-card hover-lift">
           <div className="dashboard-stat-icon" style={{ background: 'rgba(139,92,246,0.15)' }}>
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" strokeWidth="2">
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
@@ -65,13 +65,13 @@ export function Dashboard({ onSelectAccount, onAddAccount }: DashboardProps): Re
       </div>
 
       {accounts.length > 0 && (
-        <div className="dashboard-section">
+        <div className="dashboard-section view-enter" style={{ animationDelay: '200ms' }}>
           <h2 className="dashboard-section-title">Accounts</h2>
-          <div className="dashboard-account-list">
+          <div className="dashboard-account-list stagger-enter">
             {accounts.map(account => (
               <button
                 key={account.id}
-                className="dashboard-account-card"
+                className="dashboard-account-card hover-lift"
                 onClick={() => onSelectAccount(account.id)}
               >
                 <AvatarDisplay

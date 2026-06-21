@@ -5,6 +5,11 @@ import { IpcChannels } from '@shared/ipc'
 
 let crashCount = 0
 const MAX_CRASH_RELOADS = 2
+let isQuitting = false
+
+export function setQuitting(value: boolean): void {
+  isQuitting = value
+}
 
 export function createMainWindow(): BrowserWindow {
   const mainWindow = new BrowserWindow({
@@ -20,6 +25,15 @@ export function createMainWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false
+    }
+  })
+
+  // Intercept close to minimize to tray (hide) instead of destroy
+  mainWindow.on('close', (event) => {
+    if (!isQuitting) {
+      event.preventDefault()
+      mainWindow.hide()
+      logger.info('Window hidden to tray')
     }
   })
 

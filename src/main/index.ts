@@ -1,5 +1,5 @@
 import { app, BrowserWindow, Tray, Menu } from 'electron'
-import { createMainWindow } from './windows/main-window'
+import { createMainWindow, setQuitting } from './windows/main-window'
 import { registerAllHandlers } from './ipc/register'
 import { storageService } from './services/storage'
 import { syncService } from './services/sync-service'
@@ -7,11 +7,30 @@ import { destroyAllProtonSessions } from './ipc/proton-handler'
 import { logger } from './services/logger'
 import { getTrayIcon, getIconDiagnostics } from './services/icon-loader'
 
+
 // Disable GPU acceleration to avoid renderer crashes on Windows
 app.disableHardwareAcceleration()
 app.commandLine.appendSwitch('disable-software-rasterizer')
 app.commandLine.appendSwitch('no-sandbox')
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+
+// Prevent multiple instances — when the window is hidden to tray and the user
+// relaunches, this ensures only one process manages all Proton sessions.
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    // Another instance was launched — focus the existing window
+    const windows = BrowserWindow.getAllWindows()
+    if (windows.length > 0) {
+      const win = windows[0]
+      if (win.isMinimized()) win.restore()
+      win.show()
+      win.focus()
+    }
+  })
+}
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -70,6 +89,17 @@ app.whenReady().then(async () => {
     await registerAllHandlers(mainWindow)
     createTray()
 
+    // Apply auto-launch setting on startup
+    try {
+      const settings = storageService.getSettings()
+      app.setLoginItemSettings({
+        openAtLogin: settings.launchOnStartup
+      })
+      logger.info('Auto-launch setting applied', { openAtLogin: settings.launchOnStartup })
+    } catch (err) {
+      logger.warn('Failed to apply auto-launch setting', err)
+    }
+
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) {
         mainWindow = createMainWindow()
@@ -87,6 +117,7 @@ app.whenReady().then(async () => {
 // Override the window close to minimize to tray instead of quitting
 app.on('before-quit', () => {
   isQuitting = true
+  setQuitting(true)
 })
 
 app.on('will-quit', () => {

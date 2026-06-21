@@ -5,6 +5,7 @@ import { IpcChannels } from '@shared/ipc'
 import { PROTON_MAIL_URL } from '@shared/constants'
 import { logger } from '../services/logger'
 import { notificationService } from '../services/notification-service'
+import { storageService } from '../services/storage'
 import type { NewEmailNotification } from '@shared/types'
 
 const sessions = new Map<string, { view: BrowserView; partition: string }>()
@@ -27,7 +28,21 @@ const lastUnreadCounts = new Map<string, number>()
 
 /** Cooldown map to prevent duplicate notifications within a short window. */
 const lastNotifTimestamps = new Map<string, number>()
-const NOTIF_COOLDOWN_MS = 3000 // 3 seconds
+const NOTIF_COOLDOWN_MS = 5000 // 5 seconds
+const EMAIL_DETAIL_TIMEOUT_MS = 3000
+
+type ProtonEmailInfo = {
+  sender: string
+  senderEmail: string
+  subject: string
+  snippet: string
+  /** Relative date string from Proton Mail list view (e.g. "2h", "Jan 15") */
+  date?: string
+  /** Whether the email has attachment indicators in the list */
+  hasAttachments?: boolean
+  /** Whether the email is starred */
+  isStarred?: boolean
+}
 
 /**
  * Trusted Proton domains — navigation to these is allowed without confirmation.
@@ -73,29 +88,54 @@ function hasDangerousProtocol(url: string): boolean {
 }
 
 /**
- * Show a native confirmation dialog for an external link.
+ * Send an external link confirmation request to the renderer.
  * Returns true if the user confirmed, false otherwise.
+ */
+/**
+ * Send an external link confirmation request to the renderer.
+ * Returns true if the user confirmed, false otherwise.
+ * Automatically confirms for domains the user has marked as trusted.
  */
 async function confirmExternalLink(url: string): Promise<boolean> {
   const mainWindow = BrowserWindow.getFocusedWindow()
   if (!mainWindow) return false
 
-  let hostname = ''
-  try { hostname = new URL(url).hostname } catch { hostname = url }
+  // Check if the URL's hostname is in the trusted domains list
+  try {
+    const parsed = new URL(url)
+    const settings = storageService.getSettings()
+    if (settings.trustedDomains?.includes(parsed.hostname)) {
+      return true // Auto-confirm trusted domains without showing modal
+    }
+  } catch {
+    // Malformed URL — proceed to show modal
+  }
 
-  const displayUrl = url.length > 100 ? url.substring(0, 100) + '...' : url
+  return new Promise(resolve => {
+    const timeout = setTimeout(() => {
+      cleanup()
+      resolve(false)
+    }, 30000)
 
-  const result = await dialog.showMessageBox(mainWindow, {
-    type: 'question',
-    title: 'External Link',
-    message: `Open this external link?`,
-    detail: `This will open in your system's default browser:\n\n${displayUrl}`,
-    buttons: ['Cancel', 'Visit Link'],
-    defaultId: 0,
-    cancelId: 0
+    const cleanup = () => {
+      clearTimeout(timeout)
+      try { ipcMain.removeListener(IpcChannels.EXTERNAL_LINK_RESULT, handler) } catch {}
+    }
+
+    const handler = (_event: any, confirmed: boolean) => {
+      cleanup()
+      resolve(confirmed)
+    }
+
+    ipcMain.once(IpcChannels.EXTERNAL_LINK_RESULT, handler)
+
+    try {
+      mainWindow.webContents.send(IpcChannels.EXTERNAL_LINK_CONFIRM, url)
+    } catch {
+      cleanup()
+      resolve(false)
+    }
   })
-
-  return result.response === 1
 }
 
 /**
@@ -170,12 +210,86 @@ function parseUnreadCount(title: string): number {
 
 function buildNotificationKey(
   accountId: string,
-  emailInfo: { sender?: string; senderEmail?: string; subject?: string; snippet?: string } | null
+  currentCount: number,
+  emailInfo: { sender?: string; senderEmail?: string; subject?: string; snippet?: string; date?: string; hasAttachments?: boolean; isStarred?: boolean } | null
 ): string {
   const sender = String(emailInfo?.senderEmail || emailInfo?.sender || '').trim().toLowerCase()
   const subject = String(emailInfo?.subject || '').trim().toLowerCase()
   const snippet = String(emailInfo?.snippet || '').trim().toLowerCase()
-  return [accountId, sender, subject, snippet].filter(Boolean).join('|') || `${accountId}|proton`
+  return [accountId, currentCount, sender, subject, snippet, Date.now()].filter(Boolean).join('|')
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  return new Promise(resolve => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      resolve(fallback)
+    }, timeoutMs)
+
+    promise
+      .then(value => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(value)
+      })
+      .catch(() => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(fallback)
+      })
+  })
+}
+
+function buildProtonNotification(
+  accountId: string,
+  currentCount: number,
+  increasedBy: number,
+  emailInfo: ProtonEmailInfo | null
+): NewEmailNotification {
+  const id = `proton-${accountId}-${currentCount}-${Date.now()}`
+  const account = storageService.getAccount(accountId)
+  return {
+    id,
+    accountId,
+    provider: 'proton',
+    notificationKey: buildNotificationKey(accountId, currentCount, emailInfo),
+    from: {
+      name: emailInfo?.sender || 'Proton Mail',
+      address: emailInfo?.senderEmail || ''
+    },
+    subject: emailInfo?.subject || (emailInfo?.sender ? `New email from ${emailInfo.sender}` : 'New email received'),
+    snippet: emailInfo?.snippet || '',
+    timestamp: Date.now(),
+    date: emailInfo?.date,
+    hasAttachments: emailInfo?.hasAttachments,
+    isStarred: emailInfo?.isStarred
+  }
+}
+
+function notifyForProtonMail(
+  view: BrowserView,
+  accountId: string,
+  currentCount: number,
+  increasedBy: number
+): void {
+  logger.info('Proton notify triggered', { accountId, currentCount, increasedBy })
+  withTimeout(fetchLatestUnreadEmail(view, accountId), EMAIL_DETAIL_TIMEOUT_MS, null).then(emailInfo => {
+    if (emailInfo) {
+      logger.info('fetchLatestUnreadEmail succeeded', {
+        sender: emailInfo.sender,
+        subject: emailInfo.subject,
+        hasDate: !!emailInfo.date,
+        hasAttachments: emailInfo.hasAttachments
+      })
+    } else {
+      logger.info('fetchLatestUnreadEmail returned null — using fallback text')
+    }
+    notificationService.enqueueNotification(buildProtonNotification(accountId, currentCount, increasedBy, emailInfo))
+  })
 }
 
 /**
@@ -184,152 +298,405 @@ function buildNotificationKey(
  * This is far more reliable than querying the DOM for specific class names,
  * since Proton Mail uses obfuscated, dynamically-generated CSS classes.
  */
-async function fetchLatestUnreadEmail(view: BrowserView): Promise<{ sender: string; senderEmail: string; subject: string; snippet: string } | null> {
+async function fetchLatestUnreadEmail(view: BrowserView, accountId: string): Promise<ProtonEmailInfo | null> {
   try {
+    // Step 0: Poll for captured notification data first (Proton may fire the browser notification
+    // slightly AFTER the page title update, so we need to wait a bit for __lastProtonNotification)
+    const capturedData = await view.webContents.executeJavaScript(`
+      (function() {
+        var start = Date.now();
+        var maxWait = 2500;
+        var interval = 80;
+
+        // Clear any stale notification data from UI actions (e.g. "Star conversation" toasts)
+        // so we only capture fresh email notifications that fire after this point.
+        window.__lastProtonNotification = null;
+
+        function tryGet() {
+          var n = window.__lastProtonNotification;
+          if (n && (n.sender || n.subject || n.body)) {
+            window.__lastProtonNotification = null;
+            return n;
+          }
+          return null;
+        }
+
+        // Try immediately first (fast path)
+        var immediate = tryGet();
+        if (immediate) return JSON.stringify(immediate);
+
+        // Poll with async delay if nothing yet
+        return new Promise(function(resolve) {
+          function poll() {
+            var found = tryGet();
+            if (found) {
+              resolve(JSON.stringify(found));
+            } else if (Date.now() - start >= maxWait) {
+              resolve(null);
+            } else {
+              setTimeout(poll, interval);
+            }
+          }
+          setTimeout(poll, interval);
+        });
+      })()
+    `)
+
+    // Parse captured notification data if found
+    if (capturedData) {
+      try {
+        const parsed = JSON.parse(capturedData)
+        if (parsed && (parsed.sender || parsed.subject || parsed.body)) {
+          const sender = cleanCapturedText(parsed.sender) || ''
+          const body = cleanCapturedText(parsed.body) || ''
+          const subject = cleanCapturedText(parsed.subject) || ''
+
+          // Try to extract sender email from text
+          let senderEmail = ''
+          const emailMatch = (parsed.senderEmail || sender || body).match(/[\\w.+-]+@[\\w-]+\\.[\\w.]+/i)
+          if (emailMatch) senderEmail = emailMatch[0]
+
+          // Get metadata from DOM
+          const metaResult = await view.webContents.executeJavaScript(`
+            (function() {
+              try {
+                var rows = document.querySelectorAll('[data-testid*="message-row" i], [class*="item-container--row"]');
+                for (var ri = 0; ri < rows.length; ri++) {
+                  var row = rows[ri];
+                  var isRead = /\\bread\\b/i.test(row.className?.toString() || '');
+                  if (isRead) continue;
+                  var hasAttachments = false;
+                  var isStarred = false;
+                  var svgs = row.querySelectorAll('svg use');
+                  for (var si = 0; si < svgs.length; si++) {
+                    var href = svgs[si].getAttribute('href') || svgs[si].getAttribute('xlink:href') || '';
+                    if (/attachment|paperclip|ic-paperclip|ic-attachment/i.test(href)) hasAttachments = true;
+                    if (/star|ic-star/i.test(href)) isStarred = true;
+                  }
+                  if (!isStarred) isStarred = !!row.querySelector('[aria-label*="star" i]');
+                  return JSON.stringify({ hasAttachments: hasAttachments, isStarred: isStarred });
+                }
+                return JSON.stringify({ hasAttachments: false, isStarred: false });
+              } catch(e) {
+                return JSON.stringify({ hasAttachments: false, isStarred: false });
+              }
+            })()
+          `)
+          const metadata = metaResult ? JSON.parse(metaResult) : { hasAttachments: false, isStarred: false }
+
+          // Determine if we have meaningful data
+          const hasMeaningfulSender = sender.length > 0 && !/^(proton mail|new email received|new message received|new message in proton mail|\(no subject\))$/i.test(sender)
+          const hasMeaningfulSubject = subject.length > 0 && !/^(proton mail|new email received|new message received|new message in proton mail|\(no subject\))$/i.test(subject)
+
+          if (hasMeaningfulSubject || hasMeaningfulSender) {
+            
+            return {
+              sender: hasMeaningfulSender ? sender : (sender || 'New Email'),
+              senderEmail: senderEmail,
+              subject: hasMeaningfulSubject ? subject : (subject || 'New email received'),
+              snippet: parsed.snippet || '',
+              date: '',
+              hasAttachments: metadata.hasAttachments,
+              isStarred: metadata.isStarred
+            }
+          }
+        }
+      } catch {
+        // JSON parse error — fall through to DOM strategies
+      }
+    }
+
+        // --- Strategy 0.5: Targeted sender extraction from DOM ---
+        // Look for the specific data-testid elements that Proton uses for sender info.
+        // This is far more reliable than generic text extraction.
+        const targetedResult = await view.webContents.executeJavaScript(`
+          (function() {
+            try {
+              var unreadRows = document.querySelectorAll(
+                '[data-testid*="message-item" i]:not(.read), ' +
+                '[data-testid*="conversation-row" i]:not(.read), ' +
+                '[data-testid*="message-row" i]:not(.read), ' +
+                '[class*="item-container--row"]:not(.read)'
+              );
+              var allRows = unreadRows.length > 0
+                ? Array.from(unreadRows)
+                : Array.from(document.querySelectorAll(
+                    '[data-testid*="message-item" i], ' +
+                    '[data-testid*="conversation-row" i], ' +
+                    '[data-testid*="message-row" i], ' +
+                    '[class*="item-container--row"]'
+                  ));
+              for (var ri = 0; ri < allRows.length; ri++) {
+                try {
+                  var row = allRows[ri];
+                  var rect = row.getBoundingClientRect();
+                  if (rect.width < 50 || rect.height < 20) continue;
+                  var senderCol = row.querySelector('[data-testid="message-column:sender-address"]');
+                  if (!senderCol) senderCol = row.querySelector('[data-testid*="sender-address" i]');
+                  if (senderCol) {
+                    var senderEmail = senderCol.getAttribute('title') || '';
+                    var senderNameSpan = senderCol.querySelector('span');
+                    var senderName = senderNameSpan ? (senderNameSpan.textContent || '').trim() : '';
+                    var subjectEl = row.querySelector('[data-testid="message-row:subject"]');
+                    if (!subjectEl) subjectEl = row.querySelector('[id^="message-subject-"]');
+                    if (!subjectEl) subjectEl = row.querySelector('[data-testid*="subject" i]');
+                    var subject = subjectEl ? (subjectEl.textContent || '').trim() : '';
+                    subject = subject.replace(/^\\[\\d+\\]\\s*/, '').trim();
+                    var snippet = '';
+                    var snippetEl = row.querySelector('[data-testid*="snippet" i]');
+                    if (snippetEl) snippet = (snippetEl.textContent || '').trim();
+                    var dateEl = row.querySelector('time[datetime]');
+                    var date = dateEl ? (dateEl.textContent || '').trim() : '';
+                    var hasAttachments = false;
+                    var isStarred = false;
+                    var svgs = row.querySelectorAll('svg use');
+                    for (var si = 0; si < svgs.length; si++) {
+                      var href = svgs[si].getAttribute('href') || svgs[si].getAttribute('xlink:href') || '';
+                      if (/attachment|paperclip|ic-paperclip|ic-attachment/i.test(href)) hasAttachments = true;
+                      if (/star|ic-star/i.test(href)) isStarred = true;
+                    }
+                    var finalName = senderName || senderEmail || 'New Email';
+                    var finalEmail = senderEmail || '';
+                    var emailInName = finalName.match(/[\\w.+-]+@[\\w-]+\\.[\\w.]+/i);
+                    if (emailInName && !finalEmail) {
+                      finalEmail = emailInName[0];
+                    }
+                    var hasMeaningfulSender = finalName.length > 0 && !/^(proton mail|new email received|new message received|\\*\\*|__)$/i.test(finalName);
+                    var hasMeaningfulSubject = subject.length > 0 && !/^(proton mail|new email received|new message received|\\(no subject\\))$/i.test(subject);
+                    if (hasMeaningfulSender || hasMeaningfulSubject) {
+                      return JSON.stringify({
+                        sender: hasMeaningfulSender ? finalName : (finalName || 'New Email'),
+                        senderEmail: finalEmail,
+                        subject: hasMeaningfulSubject ? subject : (subject || 'New email received'),
+                        snippet: snippet,
+                        date: date,
+                        hasAttachments: hasAttachments,
+                        isStarred: isStarred
+                      });
+                    }
+                  }
+                } catch (e) {}
+              }
+            } catch (e) {}
+            return null;
+          })()
+        `)
+
+        if (targetedResult) {
+          try {
+            const parsed = JSON.parse(targetedResult)
+            logger.info('Proton sender extracted via targeted DOM query', {
+              sender: parsed.sender,
+              senderEmail: parsed.senderEmail,
+              subject: parsed.subject
+            })
+            return parsed
+          } catch {}
+        }
+
+        // Step 1: Run DOM strategies (mailbox observer + direct scan)
+        const account = storageService.getAccount(accountId)
+        const accountEmail = account?.email || ''
+        const accountLabel = account?.name || ''
     const result = await view.webContents.executeJavaScript(`
       (function() {
-        // Helper: find first email-like string in text
+        var accountEmail = ${JSON.stringify(accountEmail)};
+        var accountLabel = ${JSON.stringify(accountLabel)};
+
+        function clean(text) {
+          return String(text || '').replace(/[\\u0000-\\u001f\\u007f]/g, ' ').replace(/\\s+/g, ' ').trim();
+        }
+
         function extractEmailFromText(text) {
           var match = text.match(/[\\w.+-]+@[\\w-]+\\.[\\w.]+/);
           return match ? match[0] : '';
         }
 
-        // Helper: find an email address in or around the element
-        function findSenderEmail(el) {
-          if (!el) return '';
-          // Check element's own text and nearby elements
-          var text = el.textContent || '';
-          var email = extractEmailFromText(text);
-          if (email) return email;
-          // Check parent for email
-          var parent = el.parentElement;
-          if (parent) {
-            email = extractEmailFromText(parent.textContent || '');
-            if (email) return email;
-          }
-          // Check previous sibling
-          var prev = el.previousElementSibling;
-          if (prev) {
-            email = extractEmailFromText(prev.textContent || '');
-            if (email) return email;
-          }
-          // Check next sibling
-          var next = el.nextElementSibling;
-          if (next) {
-            email = extractEmailFromText(next.textContent || '');
-            if (email) return email;
-          }
-          return '';
+        function isGenericText(text) {
+          var normalized = clean(text).toLowerCase();
+          return !normalized ||
+            normalized === 'proton mail' ||
+            normalized === 'new email received' ||
+            normalized === 'new message received' ||
+            normalized === 'new message in proton mail' ||
+            normalized === '(no subject)';
         }
 
-        // Try to get email from a DOM element
-        function tryGetSenderEmailFromRow(rowElement) {
-          if (!rowElement) return '';
-          // Look for elements with href="mailto:..."
-          var mailtoLinks = rowElement.querySelectorAll('a[href^="mailto:"]');
-          for (var i = 0; i < mailtoLinks.length; i++) {
-            var href = mailtoLinks[i].getAttribute('href') || '';
-            var email = href.replace('mailto:', '').split('?')[0].trim();
-            if (email) return email;
-          }
-          // Fallback: look for email pattern in any text
-          var allText = rowElement.textContent || '';
-          var match = allText.match(/[\\w.+-]+@[\\w-]+\\.[\\w.]+/);
-          return match ? match[0] : '';
+        function isAccountIdentity(text) {
+          var normalized = clean(text).toLowerCase();
+          var email = clean(accountEmail).toLowerCase();
+          var label = clean(accountLabel).toLowerCase();
+          if (!normalized) return false;
+          if (email && (normalized === email || normalized.indexOf(email + ' |') === 0)) return true;
+          if (label && (normalized === label || normalized.indexOf(label + ' |') === 0)) return true;
+          return normalized.indexOf('mail.proton.me') >= 0;
         }
 
-        // --- Strategy 0: Read from the mailbox observer (most reliable) ---
+        function looksLikeNavigationJunk(text) {
+          var normalized = clean(text).toLowerCase();
+          if (!normalized) return false;
+          if (normalized.length > 260) return true;
+          return /\\b(open navigation|all mail|drafts|sent|starred|archive|spam|trash|folders|labels|manage your folders|create a new folder|inbox drafts sent)\\b/i.test(normalized);
+        }
+
+        function isInvalidMailboxItem(item) {
+          if (!item) return true;
+          var sender = clean(item.sender);
+          var subject = clean(item.subject);
+          var snippet = clean(item.snippet);
+          if (looksLikeNavigationJunk(sender) || looksLikeNavigationJunk(subject) || looksLikeNavigationJunk(snippet)) return true;
+          if (!snippet && isAccountIdentity(sender) && isAccountIdentity(subject)) return true;
+          if (!snippet && sender && sender.toLowerCase() === subject.toLowerCase() && (isAccountIdentity(sender) || isAccountIdentity(subject))) return true;
+          return false;
+        }
+
+        function isSeparatorOnlyLine(text) {
+          var normalized = (text || '').replace(/\\s+/g, '');
+          return normalized.length > 0 && /^[+*_=#~^|<>\-]{5,}$/.test(normalized);
+        }
+
+        var metadata = getRowMetadata();
+
+        // --- Strategy 1: Read from the mailbox observer ---
         if (window.__mailbridgeLastMailboxItems && window.__mailbridgeLastMailboxItems.length > 0) {
-          var firstItem = window.__mailbridgeLastMailboxItems[0];
+          var candidates = window.__mailbridgeLastMailboxItems.filter(function(item) {
+            return item && !isInvalidMailboxItem(item);
+          });
+          var unreadCandidates = candidates.filter(function(item) { return item.unread; });
+          if (unreadCandidates.length > 0) candidates = unreadCandidates;
+          var firstItem = candidates[0];
           if (firstItem && firstItem.sender) {
             return {
-              sender: firstItem.sender || 'New Email',
+              sender: clean(firstItem.sender) || 'New Email',
               senderEmail: firstItem.senderEmail || '',
-              subject: firstItem.subject || '(No Subject)',
-              snippet: firstItem.snippet || ''
+              subject: clean(firstItem.subject) || 'New email received',
+              snippet: clean(firstItem.snippet) || '',
+              date: firstItem.date || '',
+              hasAttachments: metadata.hasAttachments,
+              isStarred: metadata.isStarred
             };
           }
         }
 
-        // --- Strategy 1: Check if Proton fired a browser notification ---
-        var captured = window.__lastProtonNotification;
-        window.__lastProtonNotification = null;
-        if (captured && captured.sender) {
-          return {
-            sender: captured.sender || 'New Email',
-            senderEmail: captured.senderEmail || '',
-            subject: captured.subject || '(No Subject)',
-            snippet: captured.snippet || ''
-          };
+        // --- Strategy 2: Direct DOM scan ---
+        var rowSelector = [
+          'main [data-testid*="message-row" i]',
+          'main [data-proton-thread]',
+          '[class*="item-container--row"]'
+        ].join(',');
+        var allRows = document.querySelectorAll(rowSelector);
+        var targetRow = null;
+
+        for (var ri = 0; ri < allRows.length; ri++) {
+          try {
+            var rect = allRows[ri].getBoundingClientRect();
+            if (rect.width > 50 && rect.height > 20) {
+              targetRow = allRows[ri];
+              break;
+            }
+          } catch(e) {}
         }
 
-        // --- Strategy 2: Robust DOM extraction (no hardcoded selectors) ---
-        try {
-          var bestList = null;
-          var bestScore = 0;
-
-          var allElements = document.querySelectorAll('div, section, main, ul, ol');
-          for (var i = 0; i < allElements.length; i++) {
-            var el = allElements[i];
-            var children = el.children;
-            if (children.length < 2) continue;
-
-            var score = 0;
-            var visibleChildren = 0;
-            for (var j = 0; j < children.length; j++) {
-              var child = children[j];
-              var textNodes = [];
-              var walker = document.createTreeWalker(child, NodeFilter.SHOW_TEXT, null, false);
-              var node;
-              while (node = walker.nextNode()) {
-                var t = (node.textContent || '').trim();
-                if (t.length > 0) textNodes.push(t);
+        if (targetRow) {
+          var rowTexts = [];
+          var walker = document.createTreeWalker(targetRow, NodeFilter.SHOW_TEXT, null, false);
+          var node;
+          while (node = walker.nextNode()) {
+            var t = clean(node.textContent || '');
+            if (t && t.length > 1) {
+              // Skip text inside SVG elements (star button tooltips, etc.)
+              var p = node.parentElement;
+              var inSvg = false;
+              while (p) {
+                if (p.tagName && p.tagName.toLowerCase() === 'svg') { inSvg = true; break; }
+                p = p.parentElement;
               }
-              if (textNodes.length >= 3) {
-                score += textNodes.length;
-                visibleChildren++;
-              }
-            }
-
-            if (visibleChildren >= 2 && score > bestScore) {
-              bestScore = score;
-              bestList = el;
+              if (inSvg) continue;
+              if (/^\\d+$/.test(t)) continue;
+              if (looksLikeNavigationJunk(t)) continue;
+              rowTexts.push(t);
             }
           }
 
-          if (!bestList || bestList.children.length === 0) return null;
-
-          var firstItem = bestList.children[0];
-          var texts = [];
-          var tw = document.createTreeWalker(firstItem, NodeFilter.SHOW_TEXT, null, false);
-          var tn;
-          while (tn = tw.nextNode()) {
-            var t = (tn.textContent || '').trim();
-            if (t.length > 0) texts.push(t);
+          var unique = [];
+          for (var ui = 0; ui < rowTexts.length; ui++) {
+            if (unique.indexOf(rowTexts[ui]) === -1) {
+              unique.push(rowTexts[ui]);
+            }
           }
 
-          if (texts.length === 0) return null;
+          var datePattern = /^(\\d+\\s*(m|min|h|hr|d|day)\\s*ago|\\d{1,2}:\\d{2}\\s*(AM|PM)?|[A-Z][a-z]+\\s+\\d{1,2}(,\\s*\\d{4})?)$/i;
+          var extractedDate = '';
+          var meaningful = [];
+          for (var bi = 0; bi < unique.length; bi++) {
+            var block = unique[bi];
+            if (datePattern.test(block)) {
+              if (!extractedDate) extractedDate = block;
+            } else {
+              meaningful.push(block);
+            }
+          }
 
-          var meaningful = texts.filter(function(t) { return t.length > 1; });
+          if (meaningful.length > 0) {
+            var sender2 = meaningful[0] || '';
+            var subject2 = meaningful.length > 1 ? meaningful[1] : '';
+            var snippet2 = meaningful.slice(2).join(' ').substring(0, 200);
+            var fullText = targetRow.textContent || '';
 
-          // Extract sender email from the row
-          var senderEmail = tryGetSenderEmailFromRow(firstItem);
-
-          return {
-            sender: meaningful[0] || 'New Email',
-            senderEmail: senderEmail,
-            subject: meaningful[1] || '(No Subject)',
-            snippet: meaningful.slice(2).join(' ').substring(0, 200) || ''
-          };
-        } catch (e) {
-          return null;
+            return {
+              sender: sender2 || 'New Email',
+              senderEmail: extractEmailFromText(fullText),
+              subject: subject2 || 'New email received',
+              snippet: snippet2 || '',
+              date: extractedDate || '',
+              hasAttachments: metadata.hasAttachments,
+              isStarred: metadata.isStarred
+            };
+          }
         }
+
+        function getRowMetadata() {
+          try {
+            var rows = document.querySelectorAll('[data-testid*="message-row" i], [class*="item-container--row"]');
+            for (var ri = 0; ri < rows.length; ri++) {
+              var row = rows[ri];
+              var isRead = /\\bread\\b/i.test(row.className?.toString() || '');
+              if (isRead) continue;
+              var hasAttachments = false;
+              var isStarred = false;
+              var svgs = row.querySelectorAll('svg use');
+              for (var si = 0; si < svgs.length; si++) {
+                var href = svgs[si].getAttribute('href') || svgs[si].getAttribute('xlink:href') || '';
+                if (/attachment|paperclip|ic-paperclip|ic-attachment/i.test(href)) hasAttachments = true;
+                if (/star|ic-star/i.test(href)) isStarred = true;
+              }
+              if (!isStarred) isStarred = !!row.querySelector('[aria-label*="star" i]');
+              return { hasAttachments: hasAttachments, isStarred: isStarred };
+            }
+            if (rows.length > 0) {
+              var firstRow = rows[0];
+              return { hasAttachments: !!firstRow.querySelector('use[href*="attachment" i], use[href*="paperclip" i]'), isStarred: !!firstRow.querySelector('[aria-label*="star" i]') };
+            }
+            return { hasAttachments: false, isStarred: false };
+          } catch(e) {
+            return { hasAttachments: false, isStarred: false };
+          }
+        }
+
+        return null;
       })()
     `)
     return result
   } catch {
     return null
   }
+}
+
+function cleanCapturedText(value: string): string {
+  return String(value || '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 /**
@@ -349,6 +716,13 @@ function injectNotificationInterceptor(view: BrowserView): void {
       function PatchedNotification(title, options) {
         // Extract sender name from notification title
         var sender = (title || '').trim();
+
+        // Skip capturing non-email notifications (UI action toasts like "Star conversation",
+        // "Conversation starred", "Message deleted", etc.) so we don't pick up stale data.
+        if (/\b(star|unstar|moved|deleted|removed|archived|trashed)\b/i.test(sender)) {
+          return new OrigNotification(title, options);
+        }
+
         // Extract subject + snippet from notification body
         var body = (options && options.body || '').trim();
         var subject = body;
@@ -394,7 +768,8 @@ function injectNotificationInterceptor(view: BrowserView): void {
           sender: sender || 'New Email',
           senderEmail: senderEmail,
           subject: subject || '(No Subject)',
-          snippet: snippet || ''
+          snippet: snippet || '',
+          body: body || ''
         };
 
         // Still create the original notification (don't suppress Proton's UI)
@@ -512,17 +887,19 @@ function injectMailboxObserver(view: BrowserView): void {
         return false;
       }
 
-      function isLikelyMailboxMetadataBlock(el) {
-        if (!el) return false;
-        var text = extractText(el);
-        if (!text) return false;
-        // Metadata blocks are typically small badges or labels
-        if (text.length > 30) return false;
-        // Common badge patterns: "Official", "Proton", "1-5 of 20"
-        if (/^(\d+)\s*-\s*(\d+)\s+of\s+(\d+)$/i.test(text)) return true;
-        if (/^(Official|Proton|Sent|Draft|Starred|Important)$/i.test(text)) return true;
-        if (text === text.toUpperCase() && text.length > 1 && text.length < 15) return true;
-        return false;
+      function isLikelyMailboxMetadataBlock(text) {
+        var normalized = normalizeBlockText(text);
+        if (!normalized || normalized === 'Unread' || isLikelyDateText(normalized)) return true;
+        var lower = normalized.toLowerCase();
+        return (
+          lower === 'official' || lower === 'important' || lower === 'pinned' ||
+          lower === 'starred' || lower === 'primary' || lower === 'social' ||
+          lower === 'updates' || lower === 'forums' || lower === 'promotions' ||
+          lower === 'label' || lower === 'proton' || lower === 'sent' ||
+          lower === 'draft' || lower === 'drafts' ||
+          /^\d+\s*-\s*\d+\s+of\s+\d+$/i.test(normalized) ||
+          (normalized === normalized.toUpperCase() && normalized.length > 1 && normalized.length < 15)
+        );
       }
 
       function getMeaningfulTextBlocks(el) {
@@ -531,13 +908,21 @@ function injectMailboxObserver(view: BrowserView): void {
         var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
         var node;
         while (node = walker.nextNode()) {
+          // Skip text inside SVG elements (star button tooltips, etc.)
+          var p = node.parentElement;
+          var inSvg = false;
+          while (p) {
+            if (p.tagName && p.tagName.toLowerCase() === 'svg') { inSvg = true; break; }
+            p = p.parentElement;
+          }
+          if (inSvg) continue;
           var t = (node.textContent || '').replace(/\s+/g, ' ').trim();
           if (t.length > 1 && !/^[\s\d\s]*$/.test(t)) {
-            var p = node.parentElement;
-            // Skip metadata blocks
-            if (p && !isLikelyMailboxMetadataBlock(p)) {
-              texts.push(t);
-            }
+            // Skip separator-only lines and metadata blocks
+            if (isSeparatorOnlyLine(t)) continue;
+            var blockText = normalizeBlockText(t);
+            if (isLikelyMailboxMetadataBlock(blockText)) continue;
+            texts.push(t);
           }
         }
         return texts.filter(function(t, i, self) { return self.indexOf(t) === i; }); // unique
@@ -642,50 +1027,78 @@ function injectMailboxObserver(view: BrowserView): void {
       // ── Row validation ────────────────────────────────────────────
       function isLikelyMailboxRow(el) {
         try {
-          // Must be in viewport or at least have dimensions
+          if (!(el instanceof HTMLElement) || el.offsetParent === null) return false;
+
           var rect = el.getBoundingClientRect();
-          if (rect.width === 0 || rect.height === 0) return false;
-          if (rect.width < 50) return false; // too narrow
+          // Must have meaningful dimensions — too narrow or too short is not a row
+          if (rect.width < 220 || rect.height < 28 || rect.height > 240) return false;
 
-          // Must have text content
-          var text = extractText(el);
-          if (!text || text.length < 10) return false;
-
-          // Must not be in excluded regions
+          // Must not be in excluded regions (aside, nav, header, footer, dialog, toolbar, composer)
           if (isExcludedMailboxRegion(el)) return false;
 
-          // Must have date signal nearby or within
-          if (hasDateSignal(el)) return true;
+          // Must not be a text input or contenteditable
+          if (el.querySelector('textarea, [contenteditable="true"]')) return false;
 
-          // Fallback: check direct children for structured content
-          var children = el.children;
-          var textChildCount = 0;
-          for (var i = 0; i < children.length; i++) {
-            var ct = extractText(children[i]);
-            if (ct.length > 5) textChildCount++;
+          // Explicit match on known Proton row attributes
+          if (el.matches('[data-proton-companion-thread], [data-proton-thread]')) return true;
+
+          // Check text/attributes for known row patterns
+          var text = [
+            el.getAttribute('data-testid') || '',
+            el.className?.toString() || '',
+            el.getAttribute('aria-label') || ''
+          ].join(' ').toLowerCase();
+
+          var meaningfulBlocks = getMeaningfulTextBlocks(el);
+          if (meaningfulBlocks.length < 2) return false;
+
+          // Known Proton row class/testid patterns
+          if (/message-row|conversation-row|thread-row|mailbox-row|message-item|conversation/.test(text)) {
+            return hasDateSignal(el) || meaningfulBlocks.length >= 3;
           }
-          if (textChildCount >= 2) return true;
 
-          return false;
+          // Fallback: must have a link to a mail/inbox/message URL and a date signal
+          var href = extractHref(el);
+          if (!href) return false;
+
+          return hasDateSignal(el) && /\/mail|\/inbox|message/i.test(href);
         } catch(e) {
           return false;
         }
       }
 
+      // ── Separator-only line detection ────────────────────────────
+      function isSeparatorOnlyLine(text) {
+        var normalized = (text || '').replace(/\s+/g, '');
+        return normalized.length > 0 && /^[+*_=#~^|<>\-]{5,}$/.test(normalized);
+      }
+
       // ── Row collection ────────────────────────────────────────────
       function dedupeRows(rows) {
-        // Remove nested/overlapping rows by spatial coordinates
-        var seen = [];
-        return rows.filter(function(r) {
+        // Sort by top then left, then filter out rows contained within other rows
+        var sorted = rows.slice().sort(function(a, b) {
           try {
-            var rect = r.getBoundingClientRect();
-            var key = rect.top + '-' + rect.left + '-' + rect.width + '-' + rect.height;
-            if (seen.indexOf(key) >= 0) return false;
-            seen.push(key);
-            return true;
-          } catch(e) {
-            return false;
-          }
+            var ra = a.getBoundingClientRect();
+            var rb = b.getBoundingClientRect();
+            return (ra.top - rb.top) || (ra.left - rb.left);
+          } catch(e) { return 0; }
+        });
+        return sorted.filter(function(row, index) {
+          try {
+            var rect = row.getBoundingClientRect();
+            return !sorted.some(function(other, otherIndex) {
+              if (otherIndex >= index) return false;
+              try {
+                var otherRect = other.getBoundingClientRect();
+                // Other fully contains this row
+                return otherRect.left <= rect.left &&
+                       otherRect.right >= rect.right &&
+                       otherRect.top <= rect.top &&
+                       otherRect.bottom >= rect.bottom &&
+                       (otherRect.width > rect.width || otherRect.height > rect.height);
+              } catch(e2) { return false; }
+            });
+          } catch(e) { return false; }
         });
       }
 
@@ -694,14 +1107,17 @@ function injectMailboxObserver(view: BrowserView): void {
 
         // Pass 1: Explicit selectors (Proton's data attributes and test IDs)
         var explicitSelectors = [
+          '[data-proton-companion-thread]',
           '[data-proton-thread]',
-          '[role="row"][data-proton-thread]',
-          '[data-testid*="message-row"]',
-          '[data-testid*="conversation"]',
-          '[data-testid*="thread"]'
+          '[data-testid*="message-row" i]',
+          '[data-testid*="conversation-row" i]',
+          '[data-testid*="thread-row" i]',
+          '[class*="conversation-row" i]',
+          '[class*="message-row" i]',
+          '[class*="thread-row" i]',
+          '[role="row"]'
         ];
-        var selector = explicitSelectors.join(',');
-        var explicit = document.querySelectorAll(selector);
+        var explicit = document.querySelectorAll(explicitSelectors.join(','));
         for (var i = 0; i < explicit.length; i++) {
           if (isLikelyMailboxRow(explicit[i])) {
             rows.push(explicit[i]);
@@ -711,9 +1127,14 @@ function injectMailboxObserver(view: BrowserView): void {
         // Pass 2: Generic fallback - look for structured list items
         if (rows.length === 0) {
           var generic = document.querySelectorAll(
+            'main [role="row"], ' +
+            'main [role="listitem"], ' +
+            '[role="main"] [role="row"], ' +
+            '[role="main"] [role="listitem"], ' +
+            'main a[href*="/mail"], main a[href*="/inbox"], main a[href*="/message"], ' +
+            '[role="main"] a[href*="/mail"], [role="main"] a[href*="/inbox"], [role="main"] a[href*="/message"], ' +
             'div[class*="items"] > div, ' +
             'div[class*="list"] > div, ' +
-            'main > div > div, ' +
             '[role="listbox"] > [role="option"], ' +
             '[role="list"] > [role="listitem"]'
           );
@@ -727,9 +1148,26 @@ function injectMailboxObserver(view: BrowserView): void {
         return dedupeRows(rows).slice(0, MAX_ITEMS);
       }
 
+      // ── URL helpers ──────────────────────────────────────────────
+      function isInboxView() {
+        try {
+          var pathname = window.location.pathname;
+          // Normalize: remove trailing slash
+          var normalized = pathname.replace(/\/+$/, '');
+          // Only auto-refresh when on the exact inbox root, not sub-views like /inbox/conversation/...
+          return normalized.endsWith('/inbox');
+        } catch(e) { return false; }
+      }
+
       // ── Main sync function ────────────────────────────────────────
       function syncMailbox() {
         try {
+          // Skip if not on the inbox view — don't auto-refresh when reading emails or browsing other folders
+          if (!isInboxView()) {
+            window.__mailbridgeSyncStatus = 'idle';
+            return;
+          }
+
           window.__mailbridgeSyncStatus = 'syncing';
 
           // Collect rows and extract summaries
@@ -928,9 +1366,33 @@ async function clickRefreshButton(view: BrowserView): Promise<void> {
 }
 
 /**
+ * Check if the Proton webview is currently on the inbox root view.
+ * Only auto-refresh when on the exact inbox — skip sub-views like /inbox/conversation/..., /inbox/message/..., etc.
+ */
+async function isOnInboxView(view: BrowserView): Promise<boolean> {
+  try {
+    const url = view.webContents.getURL()
+    try {
+      const parsed = new URL(url)
+      const pathname = parsed.pathname
+      // Normalize: remove trailing slash
+      const normalized = pathname.replace(/\/+$/, '')
+      // Only match the exact inbox root, not sub-paths like /inbox/conversation/...
+      return normalized.endsWith('/inbox')
+    } catch {
+      // Fallback for malformed URLs
+      return false
+    }
+  } catch {
+    return false
+  }
+}
+
+/**
  * Start a periodic 10-second mailbox sync (heartbeat) that calls
  * __mailbridgeMailboxSyncNow to gently refresh Proton's mailbox view.
  * This matches the Proton project's PROTON_MAILBOX_REFRESH_HEARTBEAT_MS = 10s.
+ * Auto-refresh only runs when the user is on the inbox view.
  */
 function startMailboxSync(accountId: string, view: BrowserView): void {
   stopMailboxSync(accountId)
@@ -948,9 +1410,12 @@ function startMailboxSync(accountId: string, view: BrowserView): void {
         stopMailboxSync(accountId)
       })
       
-      // Then, click the refresh button with trusted input events
-      clickRefreshButton(view).catch(() => {
-        // Ignore errors
+      // Only click the refresh button if on the inbox view
+      // Skip when viewing conversations, settings, or any other folder
+      isOnInboxView(view).then((onInbox) => {
+        if (onInbox) {
+          clickRefreshButton(view).catch(() => {})
+        }
       })
     } catch {
       stopMailboxSync(accountId)
@@ -1124,36 +1589,7 @@ export function registerProtonHandlers(): void {
           increase: increasedBy
         })
 
-        // Fetch latest email details from the webview DOM
-        fetchLatestUnreadEmail(view).then(emailInfo => {
-          const notification: NewEmailNotification = {
-            id: `proton-${accountId}-${currentCount}-${Date.now()}`,
-            accountId,
-            provider: 'proton',
-            notificationKey: buildNotificationKey(accountId, emailInfo),
-            from: {
-              name: emailInfo?.sender || 'New Email',
-              address: emailInfo?.senderEmail || ''
-            },
-            subject: emailInfo?.subject || 'New message in Proton Mail',
-            snippet: emailInfo?.snippet || `You have ${increasedBy} new message(s)`,
-            timestamp: Date.now()
-          }
-          notificationService.enqueueNotification(notification)
-        }).catch(() => {
-          // Fallback: generic notification
-          const notification: NewEmailNotification = {
-            id: `proton-${accountId}-${currentCount}-${Date.now()}`,
-            accountId,
-            provider: 'proton',
-            notificationKey: `${accountId}|fallback|${currentCount}`,
-            from: { name: 'Proton Mail', address: '' },
-            subject: 'New message in Proton Mail',
-            snippet: `You have ${increasedBy} new message(s)`,
-            timestamp: Date.now()
-          }
-          notificationService.enqueueNotification(notification)
-        })
+        notifyForProtonMail(view, accountId, currentCount, increasedBy)
       }
 
       lastUnreadCounts.set(accountId, currentCount)
@@ -1245,31 +1681,7 @@ export function registerProtonHandlers(): void {
           accountId, prevCount, currentCount, increase: increasedBy
         })
 
-        fetchLatestUnreadEmail(view).then(emailInfo => {
-          const notification: NewEmailNotification = {
-            id: `proton-${accountId}-${currentCount}-${Date.now()}`,
-            accountId,
-            provider: 'proton',
-            notificationKey: buildNotificationKey(accountId, emailInfo),
-            from: { name: emailInfo?.sender || 'New Email', address: emailInfo?.senderEmail || '' },
-            subject: emailInfo?.subject || 'New message in Proton Mail',
-            snippet: emailInfo?.snippet || `You have ${increasedBy} new message(s)`,
-            timestamp: Date.now()
-          }
-          notificationService.enqueueNotification(notification)
-        }).catch(() => {
-          const notification: NewEmailNotification = {
-            id: `proton-${accountId}-${currentCount}-${Date.now()}`,
-            accountId,
-            provider: 'proton',
-            notificationKey: `${accountId}|fallback|${currentCount}`,
-            from: { name: 'New Email', address: '' },
-            subject: 'New message in Proton Mail',
-            snippet: `You have ${increasedBy} new message(s)`,
-            timestamp: Date.now()
-          }
-          notificationService.enqueueNotification(notification)
-        })
+        notifyForProtonMail(view, accountId, currentCount, increasedBy)
       }
 
       lastUnreadCounts.set(accountId, currentCount)
@@ -1418,10 +1830,16 @@ export function destroyAllProtonSessions(): void {
     const session_ = sessions.get(accountId)
     if (session_) {
       try {
-        const win = BrowserWindow.getFocusedWindow()
-        if (win) {
-          win.removeBrowserView(session_.view)
+        // Destroy the webContents first — this properly tears down the renderer
+        // without triggering crash events. Works reliably even when the parent
+        // window is already being destroyed during app quit.
+        if (!session_.view.webContents.isDestroyed()) {
+          session_.view.webContents.destroy()
         }
+      } catch {
+        // webContents might already be destroyed
+      }
+      try {
         ;(session_.view as any).destroy()
       } catch {
         // View might already be destroyed
@@ -1429,4 +1847,10 @@ export function destroyAllProtonSessions(): void {
     }
   }
   sessions.clear()
+  // Clear all session-related state maps for a clean restart
+  keepAliveTimers.clear()
+  mailboxSyncTimers.clear()
+  backgroundSyncTimers.clear()
+  lastUnreadCounts.clear()
+  lastNotifTimestamps.clear()
 }

@@ -70,6 +70,10 @@ export const IpcChannels = {
   LOGO_CLEAR_CACHE: 'logo:clear-cache',
   LOGO_GET_DIAGNOSTICS: 'logo:get-diagnostics',
 
+  // External Link
+  EXTERNAL_LINK_CONFIRM: 'external-link:confirm',
+  EXTERNAL_LINK_RESULT: 'external-link:result',
+
   // Error
   ERROR_REPORT: 'error:report'
 } as const

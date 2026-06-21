@@ -43,7 +43,7 @@ export function Sidebar({ activeAccountId, onSelectAccount, onAddAccount, onDash
             onClick={() => setProtonExpanded(!protonExpanded)}
           >
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-              style={{ transform: protonExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.2s' }}>
+              style={{ transform: protonExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.2s ease' }}>
               <path d="M9 18l6-6-6-6" />
             </svg>
             <span>Proton</span>
@@ -51,11 +51,11 @@ export function Sidebar({ activeAccountId, onSelectAccount, onAddAccount, onDash
           </button>
 
           {protonExpanded && (
-            <div className="sidebar-items">
+            <div className="sidebar-items stagger-enter">
               {protonAccounts.map(account => (
                 <button
                   key={account.id}
-                  className={`sidebar-item ${activeAccountId === account.id ? 'active' : ''}`}
+                  className={`sidebar-item${activeAccountId === account.id ? ' active' : ''}`}
                   onClick={() => onSelectAccount(account.id)}
                 >
                   <div

@@ -1,0 +1,950 @@
+================================================================================
+DEEP ANALYSIS: PROTON MAIL COMPANION NOTIFICATION SYSTEM
+vs.
+MAILBRIDGE NOTIFICATION SYSTEM
+================================================================================
+
+Date: June 19, 2026
+Purpose: Max-depth analysis of how the Proton project (Proton Mail Companion)
+         monitors ProtonMail through a browser wrapper, intercepts notifications,
+         and sends detailed notifications. Documenting all findings so the same
+         feature can be replicated in MailBridge.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. PROJECT ARCHITECTURE OVERVIEW
+2. BROWSER VIEW / WEBVIEW WRAPPER ARCHITECTURE
+3. NOTIFICATION INTERCEPTION SYSTEM (Proton Mail Companion)
+4. DOM SCRAPING / MAILBOX OBSERVER SYSTEM
+5. NOTIFICATION BUILDING & ENRICHMENT
+6. DEDUPLICATION & QUEUING SYSTEM
+7. NOTIFICATION DELIVERY (POPUP WINDOW)
+8. NOTIFICATION RENDERING (HTML/CSS)
+9. NOTIFICATION SOUND HANDLING
+10. UNREAD COUNT MONITORING
+11. NOTIFICATION SETTINGS & CONFIGURATION
+12. MAILBRIDGE CURRENT STATE & GAPS
+13. KEY DIFFERENCES & FEATURES TO ADOPT
+14. IMPLEMENTATION ROADMAP
+
+================================================================================
+1. PROJECT ARCHITECTURE OVERVIEW
+================================================================================
+
+--- PROTON MAIL COMPANION (Reference Project) ---
+
+File: D:\EXT\proton\src\
+
+The Proton Mail Companion is a sophisticated Electron app that wraps Proton Mail
+in a BrowserView and provides:
+- Multi-account support (Proton + Gmail)
+- Unified mailbox workspace
+- Custom notification toasts (NOT native OS notifications)
+- Logo/BIMI resolution
+- Background sync
+
+Key files for notification system:
+  src/main/notificationCenter.ts       - Queue + dedup + flush logic
+  src/main/notificationParsing.ts      - Text normalization + body parsing
+  src/main/notificationPopup.ts        - Layout + positioning + timers
+  src/main/shellUiNotificationShim.ts  - Notification API monkey-patch
+  src/main/protonMailboxObserver.ts    - DOM scraping for mailbox items
+  src/main/shellUiToast.ts             - In-page toast notifications
+  src/main/shellUi.ts                  - Shell UI injection
+  src/main/helpers/windowsToast.ts     - Windows native toast XML
+  src/renderer/notification.ts         - Notification popup renderer
+  src/renderer/notification.html       - Notification popup HTML shell
+  src/renderer/notification.css        - Notification popup styles
+  src/shared/contracts.ts              - All TypeScript interfaces
+  src/shared/proton.ts                 - Proton URL parsing + unread count
+  src/shared/constants.ts              - App constants + IPC channels
+  src/preload/index.ts                 - Context bridge API
+
+--- MAILBRIDGE (Current Project) ---
+
+File: D:\EXT\Mail\src\
+
+Key files for notification system:
+  src/main/services/notification-center.ts   - Queue + dedup (simplified)
+  src/main/services/notification-service.ts  - Build + deliver
+  src/main/services/notification-window.ts   - Popup BrowserWindow
+  src/main/services/notification-preload.ts  - Preload script (generated)
+  src/main/ipc/proton-handler.ts             - BrowserView + all injection
+  src/shared/types.ts                        - TypeScript interfaces
+  src/shared/constants.ts                    - App constants
+  src/shared/ipc.ts                          - IPC channel names
+
+================================================================================
+2. BROWSER VIEW / WEBVIEW WRAPPER ARCHITECTURE
+================================================================================
+
+--- PROTON MAIL COMPANION ---
+
+The Proton project uses a FULL Electron BrowserWindow (not BrowserView) for each
+Proton Mail account. Each account gets its own partition:
+
+  const partition = `persist:proton-companion-account-${accountId}`;
+
+The BrowserWindow is created with:
+  - nodeIntegration: false
+  - contextIsolation: true
+  - partition for isolated cookies/session
+  - Custom user agent to look like a regular Chrome browser
+  - Custom preload script that exposes `window.protonCompanion` API
+
+The preload script (src/preload/index.ts) exposes a rich API:
+  window.protonCompanion = {
+    app: { show, hide, quit, openExternal, handleMailto, showNotification, ... }
+    notification: { getCurrent, act, dismiss }
+    settings: { get, set }
+    accounts: { list, add, switch, rename, remove, reconnect }
+    runtime: { get, openPanel }
+    workspace: { getState, setMailbox, refresh, syncProtonMailbox, ... }
+    gmail: { listThreads, getThread, ... }
+    onSettingsChanged, onAccountsChanged, onRuntimeChanged, ...
+  }
+
+The Proton project also uses injected scripts (NOT preload) for:
+  - shellUi.ts: Account switcher, settings drawer, toast notifications
+  - shellUiNotificationShim.ts: Notification API override
+  - protonMailboxObserver.ts: DOM scraping for mailbox items
+
+--- MAILBRIDGE ---
+
+MailBridge uses Electron BrowserView (deprecated but still functional):
+
+  const view = new BrowserView({
+    webPreferences: {
+      partition: `persist:proton-${accountId}`,
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true
+    }
+  })
+
+The BrowserView is set on the main window via:
+  mainWindow.setBrowserView(view)
+  view.setBounds({ x: 0, y: 0, width: 800, height: 600 })
+
+Scripts are injected via executeJavaScript() - NOT preload:
+  - injectNotificationInterceptor(view)  - Notification API override
+  - injectMailboxObserver(view)          - DOM scraping
+
+The notification popup uses a SEPARATE BrowserWindow with:
+  - A generated preload script that exposes window.notificationOverlay
+  - data:text/html URL with inline HTML/CSS/JS
+
+================================================================================
+3. NOTIFICATION INTERCEPTION SYSTEM (Proton Mail Companion)
+================================================================================
+
+The Proton Mail Companion uses a 3-layer notification interception strategy:
+
+--- LAYER 1: NOTIFICATION API MONKEY-PATCH (Primary) ---
+
+File: src/main/shellUiNotificationShim.ts
+
+This is the MOST RELIABLE method. It replaces the browser's Notification API:
+
+  window.Notification = class CompanionNotification extends EventTarget {
+    constructor(title, options = {}) {
+      super();
+      this.title = String(title ?? appName);
+      this.body = typeof options.body === 'string' ? options.body : '';
+      this.silent = options.silent === true;
+      this.tag = typeof options.tag === 'string' ? options.tag : '';
+
+      // Emit show event
+      queueMicrotask(() => {
+        const event = new Event('show');
+        this.dispatchEvent(event);
+        this.onshow?.call(this, event);
+      });
+
+      // Forward to main process
+      void window.protonCompanion.app.showNotification({
+        provider: 'proton',
+        sender: this.title,
+        subject: this.title,
+        snippet: this.body,
+        title: this.title,
+        body: this.body,
+        silent: this.silent,
+        notificationKey: this.tag || [this.title, this.body].filter(Boolean).join(':'),
+      });
+    }
+  }
+
+Key features:
+  - Captures Proton's native Notification calls
+  - Extracts sender (title), subject, snippet (body)
+  - Forwards to main process via protonCompanion.app.showNotification()
+  - Respects notification enable/disable settings
+  - Falls back to MutedNotification when disabled
+
+--- LAYER 2: DOM SCRAPING (Mailbox Observer) ---
+
+File: src/main/protonMailboxObserver.ts
+
+A MutationObserver-based system that scrapes the Proton Mail DOM:
+
+  new MutationObserver(() => scheduleSync()).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+    attributes: true,
+  });
+
+Features:
+  - Collects all visible mailbox rows
+  - Extracts sender, subject, snippet, date, unread status
+  - Validates rows against exclusion criteria
+  - Deduplicates by spatial coordinates
+  - Stores items in window.__protonCompanionMailboxItems
+  - Calls window.protonCompanion.workspace.syncProtonMailbox(items)
+  - Periodic sync every 10 seconds
+  - Debounced mutation sync (120ms delay)
+
+--- LAYER 3: PRELOAD SCRIPT UNREAD MONITORING ---
+
+File: src/main/protonMailboxObserver.ts (also)
+
+The preload script monitors unread counts by:
+  1. Parsing document.title for "(N) Inbox" pattern
+  2. Scanning sidebar for unread badges
+  3. Using MutationObserver on the title element
+  4. Dispatching unread count changes via IPC
+
+--- MAILBRIDGE APPROACH ---
+
+MailBridge uses a similar but simpler approach:
+
+  // Notification API monkey-patch
+  injectNotificationInterceptor(view) -> patches window.Notification
+
+  // Mailbox observer
+  injectMailboxObserver(view) -> MutationObserver + DOM scraping
+
+  // Unread monitoring
+  view.webContents.on('page-title-updated', ...) -> parse title
+
+The key difference: MailBridge stores data on window.__lastProtonNotification
+and window.__mailbridgeLastMailboxItems, while the Proton project uses
+window.protonCompanion.app.showNotification() via the preload bridge.
+
+================================================================================
+4. DOM SCRAPING / MAILBOX OBSERVER SYSTEM
+================================================================================
+
+--- PROTON MAIL COMPANION (protonMailboxObserver.ts) ---
+
+This is the most sophisticated DOM scraping system. Key algorithms:
+
+ROW DETECTION (Two-pass):
+  Pass 1: Explicit selectors
+    [data-proton-companion-thread]
+    [data-proton-thread]
+    [data-testid*="message-row"]
+    [data-testid*="conversation-row"]
+    [data-testid*="thread-row"]
+    [class*="conversation-row"]
+    [class*="message-row"]
+    [role="row"]
+    [role="listitem"][aria-selected]
+
+  Pass 2: Generic fallback (if no explicit rows found)
+    main [role="row"]
+    main [role="listitem"]
+    main a[href]
+    main button
+
+ROW VALIDATION (isLikelyMailboxRow):
+  - Must be visible (offsetParent !== null)
+  - Width >= 220px, Height >= 28px and <= 240px
+  - Must not be in excluded regions (aside, nav, header, footer, form, dialog)
+  - Must not contain textarea or contenteditable
+  - Must have >= 2 meaningful text blocks
+  - OR match known row selectors
+  - OR have an href containing /mail, /inbox, message
+
+ROW EXTRACTION (toSummary):
+  Uses multi-strategy text extraction:
+
+  1. Explicit attribute selectors:
+     [data-proton-sender], [data-testid*="sender"], [class*="sender"], strong, b
+     [data-proton-subject], [data-testid*="subject"], [class*="subject"]
+     [data-proton-snippet], [data-testid*="snippet"], [class*="snippet"], [class*="preview"]
+     time[datetime], [data-proton-date], [data-testid*="date"], [class*="date"], [class*="time"]
+
+  2. Text block collection:
+     - Collect direct children text
+     - If only 1 child, go one level deeper
+     - Fall back to tree walker
+
+  3. Filtering:
+     - isLikelyDateText: time patterns, "today", "yesterday"
+     - isLikelyMailboxIdentityText: email addresses, "mail.proton.me"
+     - isLikelyMailboxMetadataBlock: "Unread", "Official", "Important", etc.
+
+  4. Sender resolution:
+     - If no sender from attributes, use first meaningful block
+     - If sender == subject, use alternative block
+
+  5. Subject resolution:
+     - Skip identity text, dates, metadata
+     - Prefer blocks >= 3 chars
+
+  6. Snippet resolution:
+     - Remaining blocks after sender/subject
+     - Skip identity text
+     - Max 220 chars
+
+UNREAD DETECTION (inferUnread):
+  - Check aria-label for "unread"
+  - Check font-weight >= 600 on child elements
+
+DEDUPLICATION (dedupeRows):
+  - Sort by top, then left position
+  - Filter out rows contained within other rows
+
+--- MAILBRIDGE (proton-handler.ts injectMailboxObserver) ---
+
+Simplified version with similar structure:
+  Pass 1: Explicit selectors (data-proton-thread, data-testid*, role="row")
+  Pass 2: Generic fallback (div[class*="items"] > div, main > div > div)
+
+Key differences from Proton:
+  - Uses getMeaningfulTextBlocks() instead of collectTextBlocks()
+  - Less sophisticated filtering
+  - Stores on window.__mailbridgeLastMailboxItems
+
+================================================================================
+5. NOTIFICATION BUILDING & ENRICHMENT
+================================================================================
+
+--- PROTON MAIL COMPANION ---
+
+The Proton project builds notifications through a multi-step pipeline:
+
+STEP 1: Source Detection (in main process)
+  The title change event fires -> parseUnreadCount(title) -> detect increase
+  OR the Notification API monkey-patch fires -> capture sender/subject/body
+
+STEP 2: Notification Enrichment (notificationParsing.ts)
+  Functions:
+    sanitizeNotificationText(value) - Remove control chars, normalize whitespace
+    normalizeNotificationValue(value) - Sanitize + null check
+    isGenericProtonNotificationText(value) - "new email received", "new message"
+    isPlaceholderProtonNotificationText(value) - empty, "unknown sender", etc.
+    isSeparatorOnlyNotificationLine(value) - decorative separators
+    parseProtonNotificationBody(value) - Parse "From: X\nSubject: Y\nBody" format
+    isLikelyProtonMailboxIdentityText(value, account) - Account email/name
+    isLikelyInvalidProtonMailboxItem(account, item) - Filter junk
+    selectLatestProtonMailboxItem(items) - Sort by date, prefer unread
+
+STEP 3: Notification Request (from preload or injected script)
+  {
+    provider: 'proton',
+    accountId: string,
+    notificationKey: string (for dedup),
+    sender: string,
+    subject: string,
+    snippet: string,
+    silent: boolean,
+    actions: [{ id: 'open', title: 'Open' }]
+  }
+
+STEP 4: Notification Object (UnifiedNotification)
+  {
+    provider: 'proton' | 'gmail' | 'app',
+    accountId: string | null,
+    notificationKey: string,
+    threadId: string | null,
+    messageId: string | null,
+    sender: string,
+    subject: string,
+    snippet: string,
+    silent: boolean,
+    actions: Array<{ id: string; title: string }>
+  }
+
+--- MAILBRIDGE ---
+
+Simpler pipeline:
+
+STEP 1: Title change -> parseUnreadCount -> detect increase
+  OR Notification API intercept -> capture data
+
+STEP 2: Build notification object (NewEmailNotification)
+  {
+    id: `proton-${accountId}-${currentCount}-${Date.now()}`,
+    accountId,
+    provider: 'proton',
+    notificationKey: buildNotificationKey(...),
+    from: { name, address },
+    subject,
+    snippet,
+    timestamp: Date.now()
+  }
+
+STEP 3: Enrichment in NotificationService
+  buildDisplaySubject() - Filter generic subjects
+  buildDisplaySnippet() - Build "From: X\nSubject: Y\nBody" format
+  normalizeNotificationText() - Clean text
+
+================================================================================
+6. DEDUPLICATION & QUEUING SYSTEM
+================================================================================
+
+--- PROTON MAIL COMPANION (notificationCenter.ts) ---
+
+  class NotificationCenter {
+    flushDebounceMs: 1800 (1.8 seconds)
+    dedupeWindowMs: 90000 (90 seconds)
+
+    enqueue(item):
+      dedupeKey = `${provider}:${accountId}:${notificationKey}`
+      if (now - lastSeen < dedupeWindowMs) return  // Skip duplicate
+      seen.set(dedupeKey, now)
+      pruneSeen(now)  // Clean old entries
+
+      queueKey = `${provider}:${accountId}`
+      queue.items.push(item)
+      if (!queue.timer) {
+        queue.timer = setTimeout(() => flush(queueKey), flushDebounceMs)
+      }
+
+    flushAll():
+      for each queue: flush(queueKey)
+
+    flush(queueKey):
+      clearTimeout(queue.timer)
+      delete queue
+      if (items.length > 0) onFlush(items)
+  }
+
+Key behaviors:
+  - Debounces: Multiple notifications within 1.8s are batched
+  - Deduplicates: Same notification key ignored for 90 seconds
+  - Per-account queuing: Notifications from different accounts are separate
+  - Auto-prune: Old seen entries cleaned on each enqueue
+
+--- MAILBRIDGE (notification-center.ts) ---
+
+  class NotificationCenter {
+    flushDebounceMs: 250 (250ms - much faster)
+    dedupeWindowMs: 5000 (5 seconds - much shorter)
+
+    Same structure as Proton but with tighter timing.
+  }
+
+Key differences:
+  - MailBridge flushes 7x faster (250ms vs 1800ms)
+  - MailBridge dedup window is 18x shorter (5s vs 90s)
+  - This means MailBridge may show more duplicate notifications
+
+================================================================================
+7. NOTIFICATION DELIVERY (POPUP WINDOW)
+================================================================================
+
+--- PROTON MAIL COMPANION ---
+
+Uses a SEPARATE BrowserWindow for each notification popup:
+
+  const win = new BrowserWindow({
+    width: 458,
+    height: 208-242,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    show: false,  // Show after load
+    focusable: false,
+    webPreferences: {
+      preload: notification-preload.js
+    }
+  });
+
+  // Load from compiled renderer
+  win.loadFile(notification.html)
+
+  // Show with animation
+  win.once('ready-to-show', () => win.show())
+
+  // Auto-close after timeout
+  setTimeout(() => close(win), autoDismissMs)
+
+Popup features:
+  - Stacked positioning (multiple notifications stack vertically)
+  - Animated slide-in/out
+  - Progress bar for auto-dismiss
+  - Mouse hover pauses timer
+  - Click opens main window + conversation
+  - Escape key dismisses
+  - Sound playback
+  - Provider-specific theming
+
+--- MAILBRIDGE ---
+
+Uses similar BrowserWindow approach but with data:text/html:
+
+  const win = new BrowserWindow({
+    width: 458,
+    height: 208-242,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    show: false,
+    focusable: false,
+    webPreferences: {
+      preload: this.getNotificationPreloadPath()  // Generated dynamically
+    }
+  });
+
+  // Load from inline HTML
+  win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+
+  // Show with multiple fallbacks
+  win.webContents.on('did-finish-load', () => showWindow('did-finish-load'))
+  win.once('ready-to-show', () => showWindow('ready-to-show'))
+  setTimeout(() => showWindow('fallback-timeout'), 800)
+
+Key differences:
+  - MailBridge generates preload.js dynamically (writes to userData/generated/)
+  - MailBridge uses data:text/html instead of compiled renderer
+  - MailBridge has 800ms fallback timeout for showing
+  - MailBridge has error logging for load failures
+
+================================================================================
+8. NOTIFICATION RENDERING (HTML/CSS)
+================================================================================
+
+--- PROTON MAIL COMPANION (renderer/notification.ts + notification.css) ---
+
+Uses a full React-like renderer with:
+  - Separate HTML/CSS/TS files
+  - Compiled by electron-vite
+  - CSS with @font-face (Sora font)
+  - Theme support via data-theme attribute
+  - Provider-specific color schemes
+
+Notification structure:
+  <section class="nt-card">
+    <div class="nt-shell">
+      <div class="nt-ring-wrap">  // Animated spinning ring
+        <span class="nt-ring nt-ring-outer"></span>
+        <span class="nt-ring nt-ring-inner"></span>
+        <span class="nt-core">    // Sender glyph or logo
+          <img class="nt-core-image" />  // Optional logo
+          <span class="nt-core-fallback">g</span>  // Fallback letter
+        </span>
+      </div>
+      <div class="nt-body">
+        <div class="nt-head-row">
+          <span class="nt-app">SENDER</span>
+          <span class="nt-time">3:45 PM</span>
+        </div>
+        <div class="nt-surface">
+          <h1 class="nt-subject">Subject Line</h1>
+          <p class="nt-preview">Snippet text...</p>
+        </div>
+        <div class="nt-tags">
+          <span class="nt-tag nt-tag-provider">proton</span>
+          <span class="nt-tag nt-tag-group">3 total</span>
+        </div>
+        <div class="nt-actions">
+          <button class="nt-btn nt-btn-primary">Open</button>
+          <button class="nt-btn nt-btn-default">Dismiss</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+CSS features:
+  - Clip-path cut corners
+  - Animated spinning rings
+  - Theme variables (--nt-bg, --nt-border, --nt-accent, etc.)
+  - Provider-specific overrides ([data-provider="proton"])
+  - Button hover/active states
+  - Transitions and animations
+  - Accessibility (aria-hidden for decorative elements)
+
+--- MAILBRIDGE (notification-window.ts buildHtml) ---
+
+Uses inline HTML/CSS in a template literal:
+  - Same visual structure as Proton
+  - Same animated rings
+  - Same clip-path cut corners
+  - Same layout (ring-wrap + body)
+  - Inline CSS (not compiled)
+  - No font loading (uses system fonts)
+  - Progress bar for auto-dismiss
+  - Slide-in/out animations
+
+================================================================================
+9. NOTIFICATION SOUND HANDLING
+================================================================================
+
+--- PROTON MAIL COMPANION ---
+
+Sound is played in the notification popup renderer:
+
+  async function playNotificationSound(soundUrl: string) {
+    if (!soundUrl) return;
+    if (activeNotificationAudio) {
+      activeNotificationAudio.pause();
+      activeNotificationAudio.currentTime = 0;
+    }
+    const audio = new Audio(soundUrl);
+    audio.preload = 'auto';
+    audio.volume = 1;
+    activeNotificationAudio = audio;
+    await audio.play();
+  }
+
+Sound is loaded from the settings and passed to the popup.
+
+--- MAILBRIDGE ---
+
+Sound is embedded as base64 in the HTML:
+
+  ${!payload.silent && soundData ? `
+    (function playSound() {
+      var audio = new Audio(${JSON.stringify(soundData)});
+      audio.preload = 'auto';
+      audio.volume = 0.5;
+      audio.play().catch(function() {});
+    })();
+  ` : ''}
+
+Sound is loaded from multiple candidate paths:
+  - Development: notification-sound.mp3
+  - Production: process.resourcesPath/notification-sound.mp3
+  - Various fallback paths
+
+================================================================================
+10. UNREAD COUNT MONITORING
+================================================================================
+
+--- PROTON MAIL COMPANION ---
+
+Two methods:
+
+Method 1: Title parsing (preload/index.ts)
+  function inferUnreadCount() {
+    const titleCount = parseUnreadCount(document.title);
+    if (titleCount > 0) return titleCount;
+    // Fallback: scan sidebar for badges
+    const candidates = collectUnreadCandidates();
+    let highest = 0;
+    for (const candidate of candidates) {
+      highest = Math.max(highest, parseBadgeCount(candidate.textContent));
+    }
+    return highest;
+  }
+
+Method 2: Mailbox observer (protonMailboxObserver.ts)
+  - Counts unread items from DOM scraping
+  - Reports via window.protonCompanion.workspace.syncProtonMailbox()
+
+--- MAILBRIDGE ---
+
+Method 1: Title parsing (proton-handler.ts)
+  view.webContents.on('page-title-updated', (_e, title) => {
+    const currentCount = parseUnreadCount(title);
+    const prevCount = lastUnreadCounts.get(accountId) ?? -1;
+    if (prevCount >= 0 && currentCount > prevCount) {
+      // New email detected!
+      notifyForProtonMail(view, accountId, currentCount, increasedBy);
+    }
+    lastUnreadCounts.set(accountId, currentCount);
+  });
+
+Method 2: Mailbox observer (injected script)
+  - Stores on window.__mailbridgeLastMailboxUnread
+  - Can be read by main process
+
+================================================================================
+11. NOTIFICATION SETTINGS & CONFIGURATION
+================================================================================
+
+--- PROTON MAIL COMPANION ---
+
+  notificationsEnabled: boolean      // Master toggle
+  notificationPermission: string     // OS permission
+  notificationGrouping: boolean      // Group multiple notifications
+  closeToTray: boolean               // Keep in tray
+  launchOnLogin: boolean
+  startMinimized: boolean
+  theme: string                      // Visual theme
+
+--- MAILBRIDGE ---
+
+  notificationsEnabled: boolean      // Master toggle
+  notificationSound: boolean         // Sound on/off
+  showPreviews: boolean              // Show snippet text
+  notifyForProton: boolean           // Proton-specific toggle
+  autoDismissDuration: number        // Auto-close timeout (ms)
+  doNotDisturb: boolean              // Suppress all notifications
+  clickBehavior: string              // 'open-message' | 'open-inbox'
+
+================================================================================
+12. MAILBRIDGE CURRENT STATE & GAPS
+================================================================================
+
+--- WHAT MAILBRIDGE ALREADY HAS (matching Proton) ---
+
+  ✅ Notification API monkey-patch (injectNotificationInterceptor)
+  ✅ Mailbox observer with MutationObserver (injectMailboxObserver)
+  ✅ Title-based unread detection
+  ✅ Notification queuing with debounce
+  ✅ Deduplication (though timing differs)
+  ✅ Custom popup BrowserWindow with HTML/CSS
+  ✅ Animated notification toasts (rings, slide-in, progress bar)
+  ✅ Auto-dismiss with pause on hover
+  ✅ Sound playback
+  ✅ Cooldown to prevent rapid duplicates (3s)
+  ✅ Email detail fetch with timeout (1200ms)
+  ✅ Navigation junk filtering
+  ✅ Generic text detection
+  ✅ Account identity detection
+  ✅ Mailbox item validation
+  ✅ 10-second heartbeat sync
+  ✅ 15-minute background sync
+  ✅ Keep-alive pings (4 min interval)
+  ✅ External link confirmation dialog
+
+--- WHAT MAILBRIDGE IS MISSING (from Proton) ---
+
+  ❌ Proton notification body parsing (parseProtonNotificationBody)
+     - Proton can parse "From: X\nSubject: Y\nBody" format from captured notifications
+     - MailBridge only uses simple title/body split
+
+  ❌ Mailbox item spatial deduplication
+     - Proton deduplicates rows by bounding rect coordinates
+     - MailBridge uses simpler dedup
+
+  ❌ Two-pass row collection with generic fallback
+     - Proton falls back to generic selectors when no explicit rows found
+     - MailBridge only does basic fallback
+
+  ❌ Sender/subject resolution heuristics
+     - Proton has sophisticated fallback: explicit attrs -> text blocks -> metadata filtering
+     - MailBridge is simpler
+
+  ❌ Unread inference from font-weight
+     - Proton checks computed font-weight >= 600
+     - MailBridge only checks aria-label
+
+  ❌ Logo/icon resolution for notifications
+     - Proton resolves sender logos via BIMI/favicon
+     - MailBridge shows letter glyph only
+
+  ❌ Gmail integration (not applicable, but shows architecture)
+
+  ❌ Workspace-level mailbox rendering
+     - Proton has a full unified workspace
+     - MailBridge only has BrowserView per account
+
+  ❌ Notification grouping with previews
+     - Proton supports grouped notifications with preview list
+     - MailBridge shows individual notifications
+
+  ❌ Settings sync via preload bridge
+     - Proton uses protonCompanion.settings.get()
+     - MailBridge reads directly from storage
+
+  ❌ Custom theme support in notifications
+     - Proton supports 7 themes with CSS variables
+     - MailBridge has fixed dark theme
+
+  ❌ Accessibility improvements
+     - Proton uses aria-hidden, semantic HTML
+     - MailBridge is similar but less thorough
+
+================================================================================
+13. KEY DIFFERENCES & FEATURES TO ADOPT
+================================================================================
+
+--- TIMING CONSTANTS ---
+
+  Proton:
+    flushDebounceMs: 1800 (1.8s)
+    dedupeWindowMs: 90000 (90s)
+    NOTIFICATION_POPUP_AUTO_CLOSE_MS: 16000 (16s)
+    MUTATION_SYNC_DELAY_MS: 120 (120ms)
+    PERIODIC_SYNC_INTERVAL_MS: 10000 (10s)
+    MAILBOX_RENDER_ACK_TIMEOUT_MS: 1200
+
+  MailBridge:
+    flushDebounceMs: 250 (250ms)
+    dedupeWindowMs: 5000 (5s)
+    autoDismissDuration: 5000-16000 (configurable)
+    MUTATION_SYNC_DELAY_MS: 120 (120ms)
+    MAILBOX_SYNC_INTERVAL_MS: 10000 (10s)
+    NOTIF_COOLDOWN_MS: 3000 (3s)
+
+--- RECOMMENDATION: ADOPT PROTON'S TIMING ---
+
+  MailBridge's 250ms flush is too aggressive - may cause jitter.
+  MailBridge's 5s dedup is too short - may show duplicates.
+
+  Recommended:
+    flushDebounceMs: 1000 (1s) - compromise between 250ms and 1800ms
+    dedupeWindowMs: 30000 (30s) - compromise between 5s and 90s
+    NOTIF_COOLDOWN_MS: 5000 (5s) - increase from 3s
+
+--- FEATURES TO IMPLEMENT ---
+
+1. PROTON NOTIFICATION BODY PARSING
+   - Parse "From: X\nSubject: Y\nBody" format
+   - Handle inline "From: Name <email> - Subject: X" format
+   - Extract sender email from body text
+   - Filter separator-only lines
+
+2. SPATIAL ROW DEDUPLICATION
+   - Sort rows by top/left position
+   - Filter rows contained within other rows
+   - Use bounding rect comparison
+
+3. TWO-PASS ROW COLLECTION
+   - Pass 1: Explicit selectors
+   - Pass 2: Generic fallback (main [role="row"], etc.)
+
+4. SENDER/SUBJECT RESOLUTION
+   - Use text block collection
+   - Filter metadata blocks
+   - Resolve sender from first meaningful block
+   - Resolve subject from second meaningful block
+
+5. UNREAD INFERENCE
+   - Check aria-label for "unread"
+   - Check computed font-weight >= 600
+
+6. LOGO RESOLUTION
+   - BIMI lookup for sender domain
+   - Favicon fallback
+   - Cache on disk
+
+7. NOTIFICATION GROUPING
+   - Group multiple notifications from same account
+   - Show preview list in popup
+   - "Dismiss All" action
+
+8. THEME SUPPORT
+   - CSS variables for colors
+   - Theme selector in settings
+   - Apply theme to notification popup
+
+9. ACCESSIBILITY
+   - aria-hidden for decorative elements
+   - Semantic HTML structure
+   - Keyboard navigation
+   - Screen reader support
+
+10. ERROR RESILIENCE
+    - Log notification popup load failures
+    - Handle render-process-gone
+    - Fallback timeout for showing
+    - Graceful degradation
+
+================================================================================
+14. IMPLEMENTATION ROADMAP
+================================================================================
+
+--- PHASE 1: CORE NOTIFICATION IMPROVEMENTS (Week 1) ---
+
+  1.1 Add parseProtonNotificationBody() to proton-handler.ts
+      - Parse "From: X\nSubject: Y\nBody" format
+      - Handle inline formats
+
+  1.2 Update injectNotificationInterceptor()
+      - Pass body field to __lastProtonNotification
+      - Parse body for sender/subject
+
+  1.3 Update fetchLatestUnreadEmail()
+      - Use parseProtonNotificationBody()
+      - Better sender/subject resolution
+
+  1.4 Adjust timing constants
+      - flushDebounceMs: 1000
+      - dedupeWindowMs: 30000
+      - NOTIF_COOLDOWN_MS: 5000
+
+--- PHASE 2: DOM SCRAPING IMPROVEMENTS (Week 2) ---
+
+  2.1 Add spatial row deduplication
+      - Sort by bounding rect
+      - Filter nested rows
+
+  2.2 Add two-pass row collection
+      - Pass 1: Explicit selectors
+      - Pass 2: Generic fallback
+
+  2.3 Improve sender/subject resolution
+      - Text block collection
+      - Metadata filtering
+
+  2.4 Add unread inference
+      - Check font-weight >= 600
+
+--- PHASE 3: NOTIFICATION ENHANCEMENTS (Week 3) ---
+
+  3.1 Add notification grouping
+      - Group by account
+      - Show preview list
+
+  3.2 Add theme support
+      - CSS variables
+      - Theme selector
+
+  3.3 Add logo resolution
+      - BIMI lookup
+      - Favicon fallback
+
+  3.4 Improve accessibility
+      - aria attributes
+      - Keyboard navigation
+
+--- PHASE 4: POLISH & TESTING (Week 4) ---
+
+  4.1 Error resilience
+      - Log failures
+      - Graceful degradation
+
+  4.2 Performance optimization
+      - Reduce DOM queries
+      - Cache results
+
+  4.3 Cross-platform testing
+      - Windows, macOS, Linux
+      - Different screen sizes
+
+  4.4 Documentation
+      - Update README
+      - Add inline comments
+
+================================================================================
+END OF ANALYSIS
+================================================================================
+
+This analysis covers the complete notification pipeline in both projects:
+1. Browser wrapper architecture
+2. Notification interception (API monkey-patch)
+3. DOM scraping (mailbox observer)
+4. Notification building & enrichment
+5. Deduplication & queuing
+6. Delivery (popup window)
+7. Rendering (HTML/CSS)
+8. Sound handling
+9. Unread monitoring
+10. Settings & configuration
+
+The key takeaway: MailBridge already has 90% of the notification features.
+The remaining 10% is mainly about notification body parsing, spatial dedup,
+sender resolution heuristics, and polish (themes, logos, accessibility).
+
+================================================================================

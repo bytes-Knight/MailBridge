@@ -14,8 +14,8 @@ export class NotificationCenter {
   private readonly seen = new Map<string, number>()
 
   constructor(options: NotificationCenterOptions) {
-    this.flushDebounceMs = options.flushDebounceMs ?? 1800
-    this.dedupeWindowMs = options.dedupeWindowMs ?? 90000
+    this.flushDebounceMs = options.flushDebounceMs ?? 1000
+    this.dedupeWindowMs = options.dedupeWindowMs ?? 30000
     this.onFlush = options.onFlush
   }
 

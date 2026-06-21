@@ -88,6 +88,9 @@ export interface AppSettings {
   // Cache
   autoClean: boolean
   cacheCleanInterval: number
+
+  // External link security
+  trustedDomains: string[]
 }
 
 export interface SyncStatus {
@@ -109,6 +112,16 @@ export interface NewEmailNotification {
   messageId?: string
   timestamp: number
   isRead?: boolean
+  /** Relative date string from Proton Mail list view (e.g. "2h", "Jan 15") */
+  date?: string
+  /** Whether the email has attachments */
+  hasAttachments?: boolean
+  /** Whether the email is starred */
+  isStarred?: boolean
+  /** App icon as a data URL for display in the notification circle */
+  appIconUrl?: string
+  /** The recipient account's email address (shown as the header in notifications) */
+  accountEmail?: string
 }
 
 export interface NotificationPreview {
@@ -134,11 +147,19 @@ export interface NotificationPopupState {
   snippet: string
   footer: string
   iconUrl?: string
+  appIconUrl?: string
   silent: boolean
   itemCount: number
   moreCount: number
   previews: NotificationPreview[]
   actions: NotificationAction[]
+  accentColor?: AccentColor
+  /** Relative date string from Proton Mail list view */
+  date?: string
+  /** Whether the email has attachments */
+  hasAttachments?: boolean
+  /** Whether the email is starred */
+  isStarred?: boolean
 }
 
 export interface BadgeUpdate {
@@ -245,5 +266,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   clearSessionOnExit: false,
   blockThirdPartyCookies: true,
   autoClean: false,
-  cacheCleanInterval: 24
+  cacheCleanInterval: 24,
+  trustedDomains: []
 }

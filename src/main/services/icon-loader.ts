@@ -228,6 +228,19 @@ export function getIconDiagnostics(): Record<string, unknown> {
 }
 
 /**
+ * Get the application icon as a base64 data URL suitable for use in HTML <img> tags.
+ * Returns an empty string if no icon can be resolved.
+ */
+export function getIconDataUrl(): string {
+  const assets = getIconAssets()
+  const img = assets.windowImage
+  if (!img.isEmpty()) {
+    return img.toDataURL()
+  }
+  return ''
+}
+
+/**
  * Reset the cached assets (useful in tests or if icon files change at runtime).
  */
 export function resetIconCache(): void {
