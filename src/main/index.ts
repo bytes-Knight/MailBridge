@@ -30,6 +30,19 @@ app.commandLine.appendSwitch('disable-features', 'VizDisplayCompositor') // Avoi
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=1024 --expose-gc')
 app.commandLine.appendSwitch('memory-pressure-off')
 
+// ── Windows Taskbar Pinning Fix ─────────────────────────────────────────────
+// On Windows, app.setAppUserModelId() must be called early so the pinned
+// taskbar shortcut's AppUserModelID matches the running process. Without this,
+// Windows treats the running instance as a separate app and shows the default
+// Electron icon instead of the custom one when the app is pinned.
+// The ID must match the appId in electron-builder.yml.
+try {
+  app.setAppUserModelId('com.mailbridge.app')
+  logger.info('AppUserModelID set to com.mailbridge.app')
+} catch (err) {
+  // Non-Windows platforms don't support this API
+}
+
 // Prevent multiple instances — when the window is hidden to tray and the user
 // relaunches, this ensures only one process manages all Proton sessions.
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
