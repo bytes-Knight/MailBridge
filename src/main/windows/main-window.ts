@@ -2,6 +2,7 @@ import { BrowserWindow, shell } from 'electron'
 import { join } from 'path'
 import { logger } from '../services/logger'
 import { windowStateManager } from '../services/window-state'
+import { getWindowIcon } from '../services/icon-loader'
 
 let crashCount = 0
 const MAX_CRASH_RELOADS = 10
@@ -18,6 +19,7 @@ export function createMainWindow(): BrowserWindow {
 
   const mainWindow = new BrowserWindow({
     ...windowStateManager.getWindowOptions(),
+    icon: getWindowIcon(),
     frame: false,
     titleBarStyle: 'hidden',
     show: false,
