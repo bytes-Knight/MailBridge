@@ -9,14 +9,34 @@ import { DEFAULT_SETTINGS } from '@shared/types'
 
 let SqlJs: any = null
 
+/**
+ * Maximum number of backup files to keep.
+ * Oldest backups are pruned when this limit is exceeded.
+ */
+const MAX_BACKUPS = 5
+
+/** Interval (ms) between automatic backups of the database file. */
+const BACKUP_INTERVAL_MS = 30 * 60 * 1000 // 30 minutes
+
+/**
+ * Time (ms) to wait before forcing the initial backup after startup.
+ * Gives the app time to stabilize before snapshotting.
+ */
+const INITIAL_BACKUP_DELAY_MS = 60 * 1000 // 1 minute
+
 export class StorageService {
   private db: any = null
   private dbPath: string
+  private backupDir: string
   private saveTimer: ReturnType<typeof setInterval> | null = null
+  private backupTimer: ReturnType<typeof setInterval> | null = null
   private _ready: Promise<void>
+  private recoveredFromBackup = false
 
   constructor() {
-    this.dbPath = path.join(app.getPath('userData'), DB_NAME)
+    const userDataPath = app.getPath('userData')
+    this.dbPath = path.join(userDataPath, DB_NAME)
+    this.backupDir = path.join(userDataPath, 'db-backups')
     this._ready = this._init()
   }
 
@@ -41,23 +61,174 @@ export class StorageService {
 
       // Load existing database or create new
       if (fs.existsSync(this.dbPath)) {
-        const buffer = fs.readFileSync(this.dbPath)
-        this.db = new SqlJs.Database(buffer)
-        logger.info('Loaded existing database', { path: this.dbPath, size: buffer.length })
+        const loaded = this.loadDatabase(this.dbPath)
+        if (!loaded) {
+          // Try to recover from latest backup before creating a fresh DB
+          const restored = this.restoreFromLatestBackup()
+          if (!restored) {
+            logger.warn('Could not restore from backup, creating fresh database')
+            this.db = new SqlJs.Database()
+          }
+        }
       } else {
-        this.db = new SqlJs.Database()
-        logger.info('Created new database', { path: this.dbPath })
+        // If no database exists but we have backups, restore from the latest
+        const restored = this.restoreFromLatestBackup()
+        if (!restored) {
+          this.db = new SqlJs.Database()
+          logger.info('Created new database', { path: this.dbPath })
+        }
+      }
+
+      // Verify the database is functional by running a test query
+      if (this.db) {
+        try {
+          this.db.run('PRAGMA foreign_keys = ON')
+          this.initTables()
+          // Run a quick sanity check
+          this.db.exec('SELECT COUNT(*) FROM sqlite_master')
+        } catch (err) {
+          logger.error('Database sanity check failed, attempting recovery', err)
+          const restored = this.restoreFromLatestBackup()
+          if (!restored) {
+            logger.warn('Recovery failed, creating fresh database')
+            if (this.db) { try { this.db.close() } catch { /* ignore */ } }
+            this.db = new SqlJs.Database()
+            this.db.run('PRAGMA foreign_keys = ON')
+            this.initTables()
+          }
+        }
       }
 
       this.db.run('PRAGMA foreign_keys = ON')
-      this.initTables()
       this.startAutoSave()
+      this.startAutoBackup()
 
-      logger.info('Storage service initialized', { path: this.dbPath })
+      logger.info('Storage service initialized', {
+        path: this.dbPath,
+        recovered: this.recoveredFromBackup
+      })
     } catch (err) {
       logger.error('Failed to initialize storage service', err)
       throw err
     }
+  }
+
+  /**
+   * Try to load a database file. Returns true on success, false if corrupted.
+   */
+  private loadDatabase(filePath: string): boolean {
+    try {
+      const buffer = fs.readFileSync(filePath)
+      if (buffer.length === 0) {
+        logger.warn('Database file is empty, treating as corrupted', { path: filePath })
+        return false
+      }
+      this.db = new SqlJs.Database(buffer)
+      logger.info('Loaded existing database', { path: filePath, size: buffer.length })
+      return true
+    } catch (err) {
+      logger.error('Failed to load database file, may be corrupted', { path: filePath, error: err })
+      return false
+    }
+  }
+
+  /**
+   * Restore the database from the latest valid backup.
+   * Returns true if a backup was successfully restored.
+   */
+  private restoreFromLatestBackup(): boolean {
+    try {
+      if (!fs.existsSync(this.backupDir)) return false
+
+      const backups = fs.readdirSync(this.backupDir)
+        .filter(f => f.endsWith('.db.bak'))
+        .sort()
+        .reverse()
+
+      for (const backup of backups) {
+        const backupPath = path.join(this.backupDir, backup)
+        logger.info('Attempting to restore from backup', { backup: backupPath })
+
+        if (this.loadDatabase(backupPath)) {
+          this.recoveredFromBackup = true
+          logger.info('Database recovered from backup', { backup: backupPath })
+          return true
+        }
+      }
+    } catch (err) {
+      logger.error('Failed to restore from backup', err)
+    }
+    return false
+  }
+
+  /**
+   * Create a backup of the current database.
+   */
+  private createBackup(): void {
+    try {
+      if (!this.db) return
+
+      // Ensure backup directory exists
+      if (!fs.existsSync(this.backupDir)) {
+        fs.mkdirSync(this.backupDir, { recursive: true })
+      }
+
+      // Export current DB state
+      const data = this.db.export()
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const backupPath = path.join(this.backupDir, `mailbridge-${timestamp}.db.bak`)
+
+      // Write atomically: temp file then rename
+      const tmpPath = backupPath + '.tmp'
+      fs.writeFileSync(tmpPath, Buffer.from(data))
+      fs.renameSync(tmpPath, backupPath)
+
+      // Prune old backups (keep only the latest MAX_BACKUPS)
+      this.pruneOldBackups()
+
+      logger.debug('Database backup created', { backup: backupPath, size: data.length })
+    } catch (err) {
+      logger.warn('Failed to create database backup', err)
+    }
+  }
+
+  /**
+   * Remove old backups beyond the retention limit.
+   */
+  private pruneOldBackups(): void {
+    try {
+      if (!fs.existsSync(this.backupDir)) return
+
+      const backups = fs.readdirSync(this.backupDir)
+        .filter(f => f.endsWith('.db.bak'))
+        .sort()
+        .reverse()
+
+      while (backups.length > MAX_BACKUPS) {
+        const old = backups.pop()!
+        try {
+          fs.unlinkSync(path.join(this.backupDir, old))
+        } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+  }
+
+  /**
+   * Start periodic automatic backups.
+   */
+  private startAutoBackup(): void {
+    // Delay initial backup to let app stabilize
+    setTimeout(() => {
+      this.createBackup()
+    }, INITIAL_BACKUP_DELAY_MS)
+
+    this.backupTimer = setInterval(() => {
+      try {
+        this.createBackup()
+      } catch (err) {
+        logger.error('Auto-backup failed', err)
+      }
+    }, BACKUP_INTERVAL_MS)
   }
 
   private resolveWasmPath(): string {
@@ -149,9 +320,17 @@ export class StorageService {
 
   private saveToDisk(): void {
     if (!this.db) return
-    const data = this.db.export()
-    const buffer = Buffer.from(data)
-    fs.writeFileSync(this.dbPath, buffer)
+    try {
+      const data = this.db.export()
+      const buffer = Buffer.from(data)
+      // Write atomically: temp file then rename to prevent corruption from crashes during write
+      const tmpPath = this.dbPath + '.tmp'
+      fs.writeFileSync(tmpPath, buffer)
+      // On Windows, rename is atomic for the same volume
+      fs.renameSync(tmpPath, this.dbPath)
+    } catch (err) {
+      logger.error('Failed to save database to disk', err)
+    }
   }
 
   // Query helper: run a SELECT query and return all rows as objects
@@ -302,6 +481,10 @@ export class StorageService {
 
   clearAccountNotifications(accountId: string): void {
     this.execute('DELETE FROM notification_dedup WHERE notification_id LIKE ?', [`${accountId}-%`])
+  }
+
+  clearAllNotifications(): void {
+    this.execute('DELETE FROM notification_dedup')
   }
 
   // ── Logo Cache ──────────────────────────────────────────────────────────
@@ -458,10 +641,31 @@ export class StorageService {
     }
   }
 
+  /**
+   * Check if the database was recovered from a backup on startup.
+   */
+  wasRecovered(): boolean {
+    return this.recoveredFromBackup
+  }
+
+  /** Force an immediate backup of the database. */
+  forceBackup(): boolean {
+    try {
+      this.createBackup()
+      return true
+    } catch {
+      return false
+    }
+  }
+
   destroy(): void {
     if (this.saveTimer) {
       clearInterval(this.saveTimer)
       this.saveTimer = null
+    }
+    if (this.backupTimer) {
+      clearInterval(this.backupTimer)
+      this.backupTimer = null
     }
     if (this.db) {
       this.saveToDisk()

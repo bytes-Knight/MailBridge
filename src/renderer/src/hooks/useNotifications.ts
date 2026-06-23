@@ -1,20 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import type { NewEmailNotification } from '@shared/types'
 
-interface NotificationState {
-  queue: NewEmailNotification[]
-  history: NewEmailNotification[]
-  soundEnabled: boolean
-}
-
-export function useNotifications(): NotificationState {
-  const [queue, setQueue] = useState<NewEmailNotification[]>([])
-  const [history, setHistory] = useState<NewEmailNotification[]>([])
+export function useNotifications(): { soundEnabled: boolean } {
   const [soundEnabled, setSoundEnabled] = useState(true)
   const audioContextRef = useRef<AudioContext | null>(null)
-  const timersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
-  const maxVisible = 5
-  const maxHistory = 100
 
   useEffect(() => {
     const mb = (window as any).mailbridge
@@ -30,39 +18,13 @@ export function useNotifications(): NotificationState {
     }
     loadPrefs()
 
-    // Listen for new notifications
-    const removeListener = mb?.onNewEmailNotification?.((notification: NewEmailNotification) => {
-      setQueue(prev => {
-        const next = [...prev, notification].slice(-maxVisible)
-        return next
-      })
-      setHistory(prev => {
-        return [notification, ...prev].slice(0, maxHistory)
-      })
-
-      // Auto-dismiss
-      const timer = setTimeout(() => {
-        setQueue(prev => prev.filter(n => n.id !== notification.id))
-        timersRef.current.delete(notification.id)
-      }, 5000)
-      timersRef.current.set(notification.id, timer)
-    })
-
-    // Listen for sound play
+    // Listen for sound play (sent from main process)
     const removeSoundListener = mb?.onNotificationSoundPlay?.((data: { soundData?: string }) => {
       playNotificationSound(data?.soundData || null)
     })
 
-    // Listen for conversation navigation
-    const removeNavListener = mb?.onNotificationOpenConversation?.((data: any) => {
-      // Navigation is handled by App component
-    })
-
     return () => {
-      removeListener?.()
       removeSoundListener?.()
-      removeNavListener?.()
-      timersRef.current.forEach(t => clearTimeout(t))
       if (audioContextRef.current) {
         audioContextRef.current.close()
       }
@@ -80,6 +42,10 @@ export function useNotifications(): NotificationState {
         // Fallback: generate a simple beep using Web Audio API
         if (!audioContextRef.current) {
           audioContextRef.current = new AudioContext()
+        }
+        // Resume AudioContext if suspended (autoplay policy)
+        if (audioContextRef.current.state === 'suspended') {
+          await audioContextRef.current.resume()
         }
         const ctx = audioContextRef.current
         const oscillator = ctx.createOscillator()
@@ -101,14 +67,5 @@ export function useNotifications(): NotificationState {
     }
   }, [])
 
-  const dismissNotification = useCallback((notificationId: string) => {
-    setQueue(prev => prev.filter(n => n.id !== notificationId))
-    const timer = timersRef.current.get(notificationId)
-    if (timer) {
-      clearTimeout(timer)
-      timersRef.current.delete(notificationId)
-    }
-  }, [])
-
-  return { queue, history, soundEnabled }
+  return { soundEnabled }
 }

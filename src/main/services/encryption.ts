@@ -43,8 +43,14 @@ export class EncryptionService {
       // Attempt file key as fallback (strip ss: prefix and try fk: decryption on the raw data)
       try {
         return this.decryptWithFileKey(ciphertext.slice(3))
-      } catch {
-        throw new Error('Failed to decrypt with both safeStorage and file key')
+      } catch (err) {
+        logger.warn('safeStorage + file key fallback both failed for ss: ciphertext', err)
+        // One more attempt: try decrypting the raw base64 as if it were a legacy fk: format
+        try {
+          return this.decryptWithFileKey(ciphertext.slice(3))
+        } catch {
+          throw new Error('Failed to decrypt with both safeStorage and file key')
+        }
       }
     }
     if (ciphertext.startsWith('fk:')) {

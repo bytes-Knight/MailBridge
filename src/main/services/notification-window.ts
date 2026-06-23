@@ -6,11 +6,11 @@ import { logger } from './logger'
 import * as fs from 'fs'
 import * as path from 'path'
 
-const TOAST_WIDTH = 458
-const TOAST_HEIGHT_DEFAULT = 208
-const TOAST_HEIGHT_EXPANDED = 242
+const TOAST_WIDTH = 420
+const TOAST_HEIGHT_DEFAULT = 120
+const TOAST_HEIGHT_EXPANDED = 140
 const TOAST_MARGIN = 18
-const STACK_GAP = 14
+const STACK_GAP = 10
 
 export class NotificationWindowManager {
   private windows: BrowserWindow[] = []
@@ -58,26 +58,41 @@ export class NotificationWindowManager {
     const windowHeight = this.getPopupHeight(payload)
     const { x, y } = this.getNotificationBounds(this.windows.length, windowHeight)
     const preloadPath = this.getNotificationPreloadPath()
-    const win = new BrowserWindow({
-      width: TOAST_WIDTH,
-      height: windowHeight,
-      x,
-      y,
-      frame: false,
-      transparent: true,
-      resizable: false,
-      alwaysOnTop: true,
-      skipTaskbar: true,
-      show: false,
-      hasShadow: false,
-      focusable: false,
-      icon: getWindowIcon(),
-      webPreferences: {
-        nodeIntegration: false,
-        contextIsolation: true,
-        preload: preloadPath
-      }
-    })
+
+    let win: BrowserWindow
+    try {
+      win = new BrowserWindow({
+        width: TOAST_WIDTH,
+        height: windowHeight,
+        x,
+        y,
+        frame: false,
+        transparent: true,
+        resizable: false,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        show: false,
+        hasShadow: false,
+        focusable: false,
+        icon: getWindowIcon(),
+        webPreferences: {
+          nodeIntegration: false,
+          contextIsolation: true,
+          preload: preloadPath,
+          // Disable features that may cause crashes on lightweight notification windows
+          backgroundThrottling: false,
+          spellcheck: false
+        }
+      })
+    } catch (err) {
+      logger.error('Failed to create notification window, falling back to in-app notification', {
+        id: payload.id,
+        error: String(err)
+      })
+      // Fallback: send the notification as an in-app toast through the main window instead
+      this.sendFallbackNotification(payload)
+      return
+    }
 
     win.setVisibleOnAllWorkspaces(true)
     let shown = false
@@ -139,8 +154,27 @@ export class NotificationWindowManager {
       this.close(win)
     }
 
-    ipcMain.once('notification-overlay-open', handleOpen)
-    ipcMain.once('notification-overlay-dismiss', handleDismiss)
+    const openHandler = (event: Electron.IpcMainEvent) => {
+      cleanupHandlers(event)
+      handleOpen()
+    }
+    const dismissHandler = (event: Electron.IpcMainEvent) => {
+      cleanupHandlers(event)
+      handleDismiss()
+    }
+
+    const cleanupHandlers = (_event?: Electron.IpcMainEvent) => {
+      try { ipcMain.removeListener('notification-overlay-open', openHandler) } catch {}
+      try { ipcMain.removeListener('notification-overlay-dismiss', dismissHandler) } catch {}
+    }
+
+    ipcMain.on('notification-overlay-open', openHandler)
+    ipcMain.on('notification-overlay-dismiss', dismissHandler)
+
+    // Clean up handlers when the window is destroyed (e.g. auto-dismiss)
+    win.on('closed', () => {
+      cleanupHandlers()
+    })
 
     this.windows.push(win)
     this.syncPositions()
@@ -169,6 +203,31 @@ export class NotificationWindowManager {
     }
     this.windows = []
     this.mainWindow = null
+  }
+
+  /**
+   * Fallback: send notification data through the main window as an in-app toast.
+   * Used when the popup window fails to create (e.g., system resource limits).
+   */
+  private sendFallbackNotification(payload: NotificationPopupState): void {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) return
+    try {
+      this.mainWindow.webContents.send(IpcChannels.NOTIFICATION_NEW_EMAIL, {
+        id: payload.id,
+        accountId: payload.accountId,
+        provider: payload.provider,
+        from: { name: payload.sender, address: '' },
+        subject: payload.subject,
+        snippet: payload.snippet,
+        timestamp: Date.now(),
+        threadId: payload.threadId,
+        messageId: payload.messageId,
+        appIconUrl: payload.appIconUrl || ''
+      })
+      logger.info('Fallback in-app notification sent', { id: payload.id })
+    } catch (err) {
+      logger.error('Failed to send fallback in-app notification', { id: payload.id, error: String(err) })
+    }
   }
 
   private getNotificationPreloadPath(): string {
@@ -204,7 +263,7 @@ contextBridge.exposeInMainWorld('notificationOverlay', {
     const primaryAction = payload.actions[0] || { id: 'open', title: 'Open Proton Mail', tone: 'primary' as const }
     const secondaryAction = payload.actions[1] || { id: 'dismiss', title: 'Dismiss', tone: 'default' as const }
 
-    // Override action labels: make the primary button say 'Open Email' or 'Open Proton Mail'
+    // Override action labels
     const openLabel = payload.provider === 'proton' ? 'Open Proton Mail' : 'Open Email'
     primaryAction.title = openLabel
 
@@ -216,6 +275,14 @@ contextBridge.exposeInMainWorld('notificationOverlay', {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
+:root {
+  --cbg: #0f0f13;
+  --cbd: rgba(255, 255, 255, 0.08);
+  --ct1: #e4e4e7;
+  --ct2: #a1a1aa;
+  --ct3: #71717a;
+  --cbg2: #1a1a23;
+}
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
   margin: 0;
@@ -223,580 +290,297 @@ body {
   height: 100%;
   overflow: hidden;
   background: transparent;
-  color: var(--nt-text);
+  color: var(--ct1);
   user-select: none;
-  font-family: 'Segoe UI', Arial, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
-}
-:root {
-  --nt-glass: linear-gradient(135deg, rgba(8, 8, 20, 0.92), rgba(12, 12, 30, 0.95));
-  --nt-border: ${accent.border};
-  --nt-text: #ede9fe;
-  --nt-muted: rgba(255, 255, 255, 0.3);
-  --nt-accent: ${accent.primary};
-  --nt-accent-soft: ${accent.soft};
-  --nt-accent-alt: ${accent.secondary};
-  --nt-primary-bg: ${accent.primary};
-  --nt-primary-text: #ffffff;
-  --nt-progress-start: ${accent.primary};
-  --nt-progress-end: ${accent.secondary};
-  --nt-btn-glow: ${accent.soft};
 }
 .nt-card {
   position: absolute;
   inset: 0;
-  padding: 12px 14px 14px;
+  background: var(--cbg);
+  border: 0.5px solid var(--cbd);
+  border-radius: 14px;
+  animation: ntSlideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5), 0 0 0 0.5px rgba(255, 255, 255, 0.03) inset;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   overflow: hidden;
-  border-radius: 18px;
-  animation: ntSlideIn 0.55s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 .nt-card.dismissing {
-  animation: ntSlideOut 0.4s cubic-bezier(0.55, 0, 1, 0.45) forwards;
+  animation: ntSlideOut 0.3s cubic-bezier(0.55, 0, 1, 0.45) forwards;
 }
 @keyframes ntSlideIn {
-  0% { opacity: 0; transform: translateX(60px) scale(0.92); filter: blur(4px); }
-  100% { opacity: 1; transform: translateX(0) scale(1); filter: blur(0); }
+  0% { opacity: 0; transform: translateX(48px) scale(0.95); }
+  100% { opacity: 1; transform: translateX(0) scale(1); }
 }
 @keyframes ntSlideOut {
-  0% { opacity: 1; transform: translateX(0) scale(1); filter: blur(0); }
-  100% { opacity: 0; transform: translateX(40px) scale(0.95); filter: blur(4px); }
+  0% { opacity: 1; transform: translateX(0) scale(1); }
+  100% { opacity: 0; transform: translateX(32px) scale(0.96); }
 }
-.nt-glow-border {
-  position: absolute;
-  top: -50%;
-  left: -50%;
-  width: 200%;
-  height: 200%;
-  background: conic-gradient(
-    from 0deg,
-    transparent,
-    ${accent.soft},
-    rgba(56, 189, 248, 0.06),
-    ${accent.soft},
-    transparent
-  );
-  animation: ntGlowSpin 8s linear infinite;
-  pointer-events: none;
-  z-index: 0;
-}
-@keyframes ntGlowSpin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-.nt-scanlines {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  background: repeating-linear-gradient(
-    0deg, transparent, transparent 2px,
-    rgba(255, 255, 255, 0.015) 2px, rgba(255, 255, 255, 0.015) 4px
-  );
-  mask-image: radial-gradient(ellipse at 50% 50%, black 30%, transparent 70%);
-  -webkit-mask-image: radial-gradient(ellipse at 50% 50%, black 30%, transparent 70%);
-}
-.nt-shell {
-  position: relative;
-  z-index: 1;
-  width: 100%;
-  height: 100%;
-  background: var(--nt-glass);
-  backdrop-filter: blur(28px);
-  -webkit-backdrop-filter: blur(28px);
-  border: 1px solid var(--nt-border);
-  border-radius: 18px;
-  box-shadow:
-    0 20px 60px rgba(0, 0, 0, 0.6),
-    0 0 0 1px rgba(255, 255, 255, 0.03) inset,
-    0 0 40px ${accent.soft};
-  padding: 14px 16px;
+
+/* ── Header Row (Icon + Content) ── */    .nt-top-row {
   display: flex;
-  gap: 14px;
   align-items: flex-start;
-  overflow: hidden;
+  gap: 10px;
 }
-.nt-ring-wrap {
+
+/* ── Icon ── */
+.nt-icon-wrap {
+  position: relative;
   flex-shrink: 0;
-  width: 52px;
-  height: 52px;
-  align-self: flex-start;
-  position: relative;
+  width: 40px;
+  height: 40px;
+}
+.nt-icon-box {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, ${accent.primary}, ${accent.secondary || '#8b5cf6'});
   display: flex;
   align-items: center;
   justify-content: center;
 }
-.nt-ring {
+.nt-icon-dot {
   position: absolute;
-  border-radius: 999px;
-  pointer-events: none;
-}
-.nt-ring-outer {
-  inset: 0;
-  border: 1.5px solid transparent;
-  border-top-color: var(--nt-accent);
-  border-right-color: var(--nt-accent-soft);
-  border-bottom-color: rgba(56, 189, 248, 0.3);
-  border-left-color: var(--nt-accent-soft);
-  animation: nt-spin 4s linear infinite;
-  box-shadow: 0 0 8px ${accent.soft};
-}
-.nt-ring-inner {
-  inset: 6px;
-  border: 1px solid transparent;
-  border-bottom-color: var(--nt-accent-alt);
-  border-left-color: ${accent.altSoft};
-  border-top-color: var(--nt-accent-soft);
-  animation: nt-spin 2.5s linear infinite reverse;
-  box-shadow: 0 0 6px ${accent.altSoft};
-}
-/* Orbiting particles */
-.nt-particle {
-  position: absolute;
-  width: 4px;
-  height: 4px;
+  bottom: -2px;
+  right: -2px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
-  pointer-events: none;
+  background: #00c896;
+  border: 2px solid var(--cbg);
 }
-.nt-particle.p1 {
-  background: ${accent.primary};
-  top: -2px;
-  left: 50%;
-  margin-left: -2px;
-  animation: ntParticleOrbit 3s ease-in-out infinite;
-  box-shadow: 0 0 6px ${accent.primary}66;
-}
-.nt-particle.p2 {
-  background: ${accent.secondary || '#38bdf8'};
-  bottom: 2px;
-  right: 2px;
-  animation: ntParticleOrbit 3s ease-in-out infinite 1s;
-  box-shadow: 0 0 6px ${accent.secondary || 'rgba(56, 189, 248, 0.6)'};
-}
-.nt-particle.p3 {
-  background: #c084fc;
-  bottom: 2px;
-  left: 2px;
-  animation: ntParticleOrbit 3s ease-in-out infinite 2s;
-  box-shadow: 0 0 6px rgba(192, 132, 252, 0.6);
-}
-@keyframes ntParticleOrbit {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.3; transform: scale(0.5); }
-}
-.nt-core {
-  width: 30px;
-  height: 30px;
-  border-radius: 999px;
-  background: linear-gradient(135deg, ${accent.soft}, rgba(56, 189, 248, 0.15));
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  position: relative;
-  z-index: 1;
-  overflow: hidden;
-  box-shadow: 0 0 12px ${accent.soft};
-}
-.nt-core-image {
-  width: 100%;
-  height: 100%;
-  border-radius: inherit;
-  object-fit: contain;
-  padding: 4px;
-  background: transparent;
+.nt-icon-box svg {
   display: block;
 }
-.nt-core-fallback {
-  display: none;
-  width: 100%;
-  height: 100%;
-  align-items: center;
-  justify-content: center;
-  font-size: 14px;
-  font-weight: 700;
-  color: #c4b5fd;
-}
-.nt-body {
+
+/* ── Content area ── */
+.nt-content-area {
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 2px;
 }
-.nt-head-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-.nt-recipient {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  background: linear-gradient(135deg, ${accent.primary}, #818cf8);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.nt-recipient-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: ${accent.primary};
-  box-shadow: 0 0 6px ${accent.primary}99;
-  flex-shrink: 0;
-  display: inline-block;
-  vertical-align: middle;
-  animation: ntDotPulse 2s ease-in-out infinite;
-}
-@keyframes ntDotPulse {
-  0%, 100% { opacity: 1; box-shadow: 0 0 6px ${accent.primary}99; }
-  50% { opacity: 0.5; box-shadow: 0 0 10px ${accent.primary}4D; }
-}
-.nt-time {
-  flex-shrink: 0;
-  font-size: 10px;
-  font-weight: 600;
-  color: rgba(255, 255, 255, 0.3);
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.04em;
-}
-.nt-content {
-  cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 2px 0;
-  transition: background 150ms ease;
-  border-radius: 8px;
-  margin: 0 -4px;
-  padding: 2px 4px;
-}
-.nt-content:hover {
-  background: ${accent.soft};
-}
-.nt-sender-name {
-  font-size: 14px;
-  font-weight: 700;
-  line-height: 1.3;
-  color: #ede9fe;
-  letter-spacing: -0.01em;
-}
-.nt-sender-email {
-  font-size: 10px;
-  font-weight: 500;
-  color: rgba(255, 255, 255, 0.3);
-  letter-spacing: 0.02em;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 180px;
-}
-.nt-subject {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1.35;
-  color: rgba(255, 255, 255, 0.75);
-  letter-spacing: 0.01em;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.nt-preview-line {
-  font-size: 11px;
-  line-height: 1.4;
-  color: rgba(255, 255, 255, 0.4);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.nt-bottom-row {
+
+/* ── Head row ── */
+.nt-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding-top: 4px;
-  border-top: 1px solid rgba(255, 255, 255, 0.04);
 }
-.nt-meta-left {
+.nt-head-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ct1);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nt-head-time {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--ct3);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Sender ── */
+.nt-sender {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--ct1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.35;
+}
+
+/* ── Subject + Snippet inline ── */
+.nt-message-preview {
+  font-size: 12.5px;
+  color: var(--ct2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.4;
+}
+.nt-message-preview .nt-sep {
+  color: var(--ct3);
+  margin: 0 4px;
+}
+
+/* ── Footer ── */
+.nt-footer {
   display: flex;
   align-items: center;
-  gap: 4px;
-  min-width: 0;
-  flex-shrink: 0;
+  justify-content: space-between;
+  gap: 8px;
 }
-.nt-tag {
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
+.nt-badge {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
-  padding: 3px 8px;
-  border-radius: 4px;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
+  color: ${accent.primary};
+  background: ${accent.soft};
+  border: 0.5px solid ${accent.border};
+  border-radius: 5px;
+  padding: 2px 7px;
   line-height: 1;
-  white-space: nowrap;
-}
-.nt-tag-pulse {
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  animation: ntDotPulse 2s ease-in-out infinite;
-  flex-shrink: 0;
-}
-.nt-tag-provider {
-  background: ${accent.tagBg};
-  color: ${accent.tagText};
-  box-shadow: 0 0 8px ${accent.tagBg};
-}
-.nt-tag-provider .nt-tag-pulse {
-  background: ${accent.tagText};
-  box-shadow: 0 0 6px ${accent.tagText}80;
-}
-.nt-tag-meta {
-  background: rgba(255, 255, 255, 0.04);
-  color: rgba(255, 255, 255, 0.35);
-  padding: 3px 6px;
 }
 .nt-actions {
   display: flex;
-  align-items: center;
   gap: 6px;
-  flex-shrink: 0;
 }
 .nt-btn {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  min-height: 28px;
-  padding: 4px 10px;
-  border: 1px solid transparent;
-  background: transparent;
+  justify-content: center;
   font-family: inherit;
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1.2;
-  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 7px;
+  padding: 4px 12px;
   cursor: pointer;
   white-space: nowrap;
-  transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1), filter 150ms ease, background-color 150ms ease, border-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
+  line-height: 1;
+  border: 0.5px solid transparent;
+  transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 }
-.nt-btn:hover { transform: translateY(-1px) scale(1.02); filter: brightness(1.08); }
-.nt-btn:active { transform: translateY(0) scale(0.97); }
+.nt-btn:active { transform: scale(0.96); }
 .nt-btn-primary {
-  background: linear-gradient(135deg, ${accent.primary}, ${accent.secondary || 'rgba(109, 40, 217, 1)'});
-  color: var(--nt-primary-text);
+  color: #fff;
+  background: ${accent.primary};
   border-color: transparent;
-  box-shadow: 0 2px 12px ${accent.soft};
 }
 .nt-btn-primary:hover {
-  box-shadow: 0 4px 20px ${accent.soft};
+  filter: brightness(1.1);
 }
-.nt-btn-default {
-  background: rgba(255, 255, 255, 0.04);
-  border-color: rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.55);
+.nt-btn-secondary {
+  color: var(--ct2);
+  background: var(--cbg2);
+  border-color: var(--cbd);
 }
-.nt-btn-default:hover {
-  background: rgba(255, 255, 255, 0.07);
-  border-color: rgba(255, 255, 255, 0.14);
-  color: rgba(255, 255, 255, 0.8);
+.nt-btn-secondary:hover {
+  color: var(--ct1);
+  border-color: rgba(255, 255, 255, 0.15);
 }
-.nt-progress {
+
+/* ── Screen-reader only ── */
+.nt-sr-only {
   position: absolute;
-  bottom: 0;
-  left: 0;
-  height: 3px;
-  background: linear-gradient(90deg, ${accent.primary}, ${accent.secondary || 'rgba(124, 58, 237, 1)'}, ${accent.altSoft ? '#38bdf8' : '#38bdf8'});
-  border-radius: 0 0 18px 18px;
-  transition: width 0.05s linear;
-  z-index: 2;
-  overflow: hidden;
-}
-.nt-progress-glow {
-  position: absolute;
-  right: 0;
-  top: -6px;
-  width: 20px;
-  height: 15px;
-  background: radial-gradient(ellipse, ${accent.soft}, transparent);
-  pointer-events: none;
-}
-.nt-compat-details {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  padding: 0;
-  border: 0;
-  clip: rect(0 0 0 0);
-  overflow: hidden;
-  white-space: nowrap;
-}
-@keyframes nt-spin {
-  to { transform: rotate(360deg); }
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  border: 0; clip: rect(0 0 0 0);
+  overflow: hidden; white-space: nowrap;
 }
 </style>
 </head>
 <body>
 <section class="nt-card" id="toast" data-testid="notification-popup" data-provider="${escapeHtml(payload.provider)}">
-  <div class="nt-glow-border" aria-hidden="true"></div>
-  <div class="nt-scanlines" aria-hidden="true"></div>
-  <div class="nt-shell" style="position:relative;z-index:1;">
-    <div class="nt-ring-wrap" aria-hidden="true">
-      <span class="nt-ring nt-ring-outer"></span>
-      <span class="nt-ring nt-ring-inner"></span>
-      <span class="nt-particle p1"></span>
-      <span class="nt-particle p2"></span>
-      <span class="nt-particle p3"></span>
-      <span class="nt-core nt-core-icon-only">
-        <img class="nt-core-image" src="${escapeHtml(payload.appIconUrl || '')}" alt="MailBridge" />
-        <span class="nt-core-fallback">${escapeHtml(sender.label?.charAt(0)?.toUpperCase() || 'M')}</span>
-      </span>
+  <div class="nt-top-row">
+    <div class="nt-icon-wrap" aria-hidden="true">
+      <div class="nt-icon-box">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="2" y="4" width="20" height="16" rx="3" fill="white" fill-opacity="0.15" stroke="white" stroke-width="1.5"/>
+          <path d="M2 8l10 7 10-7" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div class="nt-icon-dot"></div>
     </div>
-    <div class="nt-body">
-      <div class="nt-head-row">
-        <span class="nt-recipient">
-          <span class="nt-recipient-dot"></span>
-          ${escapeHtml(senderLine)}
-        </span>
-        <span class="nt-time">${escapeHtml(popupTime)}</span>
+
+    <div class="nt-content-area">
+      <div class="nt-head">
+        <span class="nt-head-label">${escapeHtml(senderLine)}</span>
+        <span class="nt-head-time">${escapeHtml(popupTime)}</span>
       </div>
-      <div class="nt-content" data-action="open" id="surfaceBtn">
-        <div class="nt-sender-name">${escapeHtml(sender.full || sender.label || 'Unknown Sender')}</div>
-        ${sender.email && sender.label ? `<div class="nt-sender-email">${escapeHtml(sender.email)}</div>` : ''}
-        <h1 class="nt-subject">${escapeHtml(subject || 'New email received')}</h1>
-        ${snippet ? `<p class="nt-preview-line">${escapeHtml(snippet)}</p>` : ''}
+
+      <div class="nt-sender" data-action="open">
+        ${escapeHtml(sender.full || sender.label || 'Unknown Sender')}
       </div>
-      <div class="nt-bottom-row">
-        <div class="nt-meta-left">
-          <span class="nt-tag nt-tag-provider">
-            <span class="nt-tag-pulse"></span>
-            ${escapeHtml(providerTag)}
-          </span>
-        </div>
-        <div class="nt-actions">
-          ${this.renderActionButton(secondaryAction)}
-          ${this.renderActionButton(primaryAction)}
-        </div>
-      </div>
-      <div class="nt-compat-details" aria-hidden="true">
-        <p>To: ${escapeHtml(senderLine)}</p>
-        <p>From: ${escapeHtml(sender.email || sender.full || sender.label || 'Unknown')}</p>
-        <p>Subject: ${escapeHtml(subject)}</p>
+
+      <div class="nt-message-preview" data-action="open">
+        ${escapeHtml(subject || 'New email received')}
+        ${snippet ? `<span class="nt-sep">·</span>${escapeHtml(snippet).replace(nlRe, ' ')}` : ''}
       </div>
     </div>
   </div>
-  <div class="nt-progress" id="progress" style="width:100%">
-    <div class="nt-progress-glow"></div>
+
+  <div class="nt-footer">
+    <span class="nt-badge">${escapeHtml(providerTag)}</span>
+
+    <div class="nt-actions">
+      ${this.renderActionButton(secondaryAction)}
+      ${this.renderActionButton(primaryAction)}
+    </div>
+  </div>
+
+  <div class="nt-sr-only" aria-hidden="true">
+    To: ${escapeHtml(senderLine)}. From: ${escapeHtml(sender.email || sender.full || sender.label || 'Unknown')}. Subject: ${escapeHtml(subject)}.
   </div>
 </section>
 <script>
 (function() {
   const toast = document.getElementById('toast');
-  const progress = document.getElementById('progress');
-  const duration = ${Math.max(1000, autoDismissMs)};
-  let startedAt = Date.now();
-  let pausedAt = 0;
-  let pausedTotal = 0;
-  let animFrame = null;
-  let paused = false;
-
-  function updateProgress() {
-    if (paused) {
-      animFrame = requestAnimationFrame(updateProgress);
-      return;
-    }
-    const elapsed = Date.now() - startedAt - pausedTotal;
-    const remaining = Math.max(0, 100 - (elapsed / duration) * 100);
-    progress.style.width = remaining + '%';
-    if (remaining <= 0) {
-      dismiss();
-      return;
-    }
-    animFrame = requestAnimationFrame(updateProgress);
-  }
+  const autoDismiss = ${Math.max(1000, autoDismissMs)};
+  let timer = null;
 
   function dismiss() {
-    if (animFrame) cancelAnimationFrame(animFrame);
+    if (timer) clearTimeout(timer);
     toast.classList.add('dismissing');
     setTimeout(function() {
-      try { window.notificationOverlay.onDismiss(); } catch (error) {}
-    }, 350);
+      try { window.notificationOverlay.onDismiss(); } catch (e) {}
+    }, 300);
   }
 
   function openNotification() {
-    try { window.notificationOverlay.onOpen(); } catch (error) {}
+    try { window.notificationOverlay.onOpen(); } catch (e) {}
   }
 
+  // Auto-dismiss
+  timer = setTimeout(dismiss, autoDismiss);
+
+  // Pause on hover
   toast.addEventListener('mouseenter', function() {
-    if (!paused) {
-      paused = true;
-      pausedAt = Date.now();
-    }
+    if (timer) { clearTimeout(timer); timer = null; }
   });
-
   toast.addEventListener('mouseleave', function() {
-    if (paused) {
-      paused = false;
-      pausedTotal += Date.now() - pausedAt;
-      pausedAt = 0;
+    if (!timer) {
+      timer = setTimeout(dismiss, autoDismiss);
     }
   });
 
+  // Click handling
   document.addEventListener('click', function(event) {
-    const target = event.target;
+    var target = event.target;
     if (!(target instanceof Element)) return;
-    const actionTarget = target.closest('[data-action]');
+    var actionTarget = target.closest('[data-action]');
     if (!actionTarget) return;
     event.preventDefault();
     event.stopPropagation();
-    const action = actionTarget.getAttribute('data-action');
+    var action = actionTarget.getAttribute('data-action');
     if (action === 'dismiss') dismiss();
     else openNotification();
   });
 
   document.addEventListener('keydown', function(event) {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      dismiss();
-    }
+    if (event.key === 'Escape') { event.preventDefault(); dismiss(); }
   });
 
-  animFrame = requestAnimationFrame(updateProgress);
-  try { window.notificationOverlay.onReady(); } catch (error) {}
+  try { window.notificationOverlay.onReady(); } catch (e) {}
 
-  // Handle logo image load errors — show fallback glyph
-  var core = document.querySelector('.nt-core');
-  var coreImage = document.querySelector('.nt-core-image');
-  if (core && coreImage) {
-    coreImage.addEventListener('load', function() {
-      core.setAttribute('data-image-error', 'false');
-    });
-    coreImage.addEventListener('error', function() {
-      core.setAttribute('data-image-error', 'true');
-    });
-    if (coreImage.complete) {
-      core.setAttribute('data-image-error', coreImage.naturalWidth === 0 ? 'true' : 'false');
-    }
-  }
-
-  ${!payload.silent && soundData ? `(function playSound() {
+  ${!payload.silent && soundData ? `(function() {
     try {
       var audio = new Audio(${JSON.stringify(soundData)});
-      audio.preload = 'auto';
-      audio.volume = 0.5;
+      audio.volume = 0.4;
       audio.play().catch(function() {});
-    } catch (error) {}
+    } catch (e) {}
   })();` : ''}
 })();
 </script>
@@ -805,7 +589,7 @@ body {
   }
 
   private renderActionButton(action: NotificationAction): string {
-    const toneClass = action.tone === 'primary' ? 'nt-btn-primary' : 'nt-btn-default'
+    const toneClass = action.tone === 'primary' ? 'nt-btn-primary' : 'nt-btn-secondary'
     return `<button class="nt-btn ${toneClass}" data-action="${escapeHtml(action.id)}">${escapeHtml(action.title)}</button>`
   }
 
@@ -848,6 +632,8 @@ body {
     }
   }
 }
+
+const nlRe = /\n/g
 
 function sanitizeText(value: string): string {
   return String(value || '')
@@ -924,17 +710,18 @@ interface AccentColors {
   core: string
   tagBg: string
   tagText: string
+  text: string
 }
 
 const ACCENT_MAP: Record<AccentColor, AccentColors> = {
-  indigo: { primary: '#a78bfa', secondary: '#38bdf8', soft: 'rgba(167, 139, 250, 0.25)', altSoft: 'rgba(56, 189, 248, 0.25)', border: 'rgba(99, 102, 241, 0.25)', core: '#0ea5e9', tagBg: 'rgba(56, 189, 248, 0.15)', tagText: '#38bdf8' },
-  blue: { primary: '#93c5fd', secondary: '#38bdf8', soft: 'rgba(147, 197, 253, 0.25)', altSoft: 'rgba(56, 189, 248, 0.25)', border: 'rgba(59, 130, 246, 0.25)', core: '#3b82f6', tagBg: 'rgba(56, 189, 248, 0.15)', tagText: '#38bdf8' },
-  cyan: { primary: '#67e8f9', secondary: '#a78bfa', soft: 'rgba(103, 232, 249, 0.25)', altSoft: 'rgba(167, 139, 250, 0.25)', border: 'rgba(6, 182, 212, 0.25)', core: '#06b6d4', tagBg: 'rgba(103, 232, 249, 0.15)', tagText: '#67e8f9' },
-  emerald: { primary: '#6ee7b7', secondary: '#38bdf8', soft: 'rgba(110, 231, 183, 0.25)', altSoft: 'rgba(56, 189, 248, 0.25)', border: 'rgba(16, 185, 129, 0.25)', core: '#10b981', tagBg: 'rgba(110, 231, 183, 0.15)', tagText: '#6ee7b7' },
-  amber: { primary: '#fcd34d', secondary: '#f97316', soft: 'rgba(252, 211, 77, 0.25)', altSoft: 'rgba(249, 115, 22, 0.25)', border: 'rgba(245, 158, 11, 0.25)', core: '#f59e0b', tagBg: 'rgba(252, 211, 77, 0.15)', tagText: '#fcd34d' },
-  red: { primary: '#fca5a5', secondary: '#fb923c', soft: 'rgba(252, 165, 165, 0.25)', altSoft: 'rgba(251, 146, 60, 0.25)', border: 'rgba(239, 68, 68, 0.25)', core: '#ef4444', tagBg: 'rgba(252, 165, 165, 0.15)', tagText: '#fca5a5' },
-  pink: { primary: '#f9a8d4', secondary: '#a78bfa', soft: 'rgba(249, 168, 212, 0.25)', altSoft: 'rgba(167, 139, 250, 0.25)', border: 'rgba(236, 72, 153, 0.25)', core: '#ec4899', tagBg: 'rgba(249, 168, 212, 0.15)', tagText: '#f9a8d4' },
-  violet: { primary: '#c4b5fd', secondary: '#38bdf8', soft: 'rgba(196, 181, 253, 0.25)', altSoft: 'rgba(56, 189, 248, 0.25)', border: 'rgba(139, 92, 246, 0.25)', core: '#8b5cf6', tagBg: 'rgba(196, 181, 253, 0.15)', tagText: '#c4b5fd' }
+  indigo: { primary: '#a78bfa', secondary: '#7c3aed', soft: 'rgba(167, 139, 250, 0.2)', altSoft: 'rgba(56, 189, 248, 0.2)', border: 'rgba(167, 139, 250, 0.2)', core: '#0ea5e9', tagBg: 'rgba(167, 139, 250, 0.12)', tagText: '#a78bfa', text: '#ede9fe' },
+  blue: { primary: '#93c5fd', secondary: '#3b82f6', soft: 'rgba(147, 197, 253, 0.2)', altSoft: 'rgba(56, 189, 248, 0.2)', border: 'rgba(147, 197, 253, 0.2)', core: '#3b82f6', tagBg: 'rgba(147, 197, 253, 0.12)', tagText: '#93c5fd', text: '#ede9fe' },
+  cyan: { primary: '#67e8f9', secondary: '#06b6d4', soft: 'rgba(103, 232, 249, 0.2)', altSoft: 'rgba(167, 139, 250, 0.2)', border: 'rgba(103, 232, 249, 0.2)', core: '#06b6d4', tagBg: 'rgba(103, 232, 249, 0.12)', tagText: '#67e8f9', text: '#ede9fe' },
+  emerald: { primary: '#6ee7b7', secondary: '#10b981', soft: 'rgba(110, 231, 183, 0.2)', altSoft: 'rgba(56, 189, 248, 0.2)', border: 'rgba(110, 231, 183, 0.2)', core: '#10b981', tagBg: 'rgba(110, 231, 183, 0.12)', tagText: '#6ee7b7', text: '#ede9fe' },
+  amber: { primary: '#fcd34d', secondary: '#f59e0b', soft: 'rgba(252, 211, 77, 0.2)', altSoft: 'rgba(249, 115, 22, 0.2)', border: 'rgba(252, 211, 77, 0.2)', core: '#f59e0b', tagBg: 'rgba(252, 211, 77, 0.12)', tagText: '#fcd34d', text: '#fef3c7' },
+  red: { primary: '#fca5a5', secondary: '#ef4444', soft: 'rgba(252, 165, 165, 0.2)', altSoft: 'rgba(251, 146, 60, 0.2)', border: 'rgba(252, 165, 165, 0.2)', core: '#ef4444', tagBg: 'rgba(252, 165, 165, 0.12)', tagText: '#fca5a5', text: '#fee2e2' },
+  pink: { primary: '#f9a8d4', secondary: '#ec4899', soft: 'rgba(249, 168, 212, 0.2)', altSoft: 'rgba(167, 139, 250, 0.2)', border: 'rgba(249, 168, 212, 0.2)', core: '#ec4899', tagBg: 'rgba(249, 168, 212, 0.12)', tagText: '#f9a8d4', text: '#fce7f3' },
+  violet: { primary: '#c4b5fd', secondary: '#8b5cf6', soft: 'rgba(196, 181, 253, 0.2)', altSoft: 'rgba(56, 189, 248, 0.2)', border: 'rgba(196, 181, 253, 0.2)', core: '#8b5cf6', tagBg: 'rgba(196, 181, 253, 0.12)', tagText: '#c4b5fd', text: '#ede9fe' }
 }
 
 function getAccentColors(color?: AccentColor): AccentColors {

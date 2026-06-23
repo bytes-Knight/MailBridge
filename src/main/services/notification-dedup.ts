@@ -17,5 +17,5 @@ export function clearAccountNotifications(accountId: string): void {
 }
 
 export function clearAllNotifications(): void {
-  // Re-create the dedup store
+  storageService.clearAllNotifications()
 }

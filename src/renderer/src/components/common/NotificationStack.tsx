@@ -12,7 +12,6 @@ export function NotificationStack({ onNavigateToConversation }: NotificationStac
   const [notifications, setNotifications] = useState<NewEmailNotification[]>([])
   const [autoDismissDuration, setAutoDismissDuration] = useState(5000)
   const dismissTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
-  const idCounterRef = useRef(0)
 
   // Load auto-dismiss duration from user settings
   useEffect(() => {
@@ -28,20 +27,17 @@ export function NotificationStack({ onNavigateToConversation }: NotificationStac
   useEffect(() => {
     const mb = (window as any).mailbridge
     const removeListener = mb?.onNewEmailNotification?.((newNotif: NewEmailNotification) => {
-      idCounterRef.current += 1
-      const notifWithKey = { ...newNotif, id: `${newNotif.id}-${idCounterRef.current}` }
-      
       setNotifications(prev => {
-        const next = [notifWithKey, ...prev].slice(0, MAX_STACK)
+        const next = [newNotif, ...prev].slice(0, MAX_STACK)
         return next
       })
 
       // Auto-dismiss timer for this notification
       const timer = setTimeout(() => {
-        setNotifications(prev => prev.filter(n => n.id !== notifWithKey.id))
-        dismissTimersRef.current.delete(notifWithKey.id)
+        setNotifications(prev => prev.filter(n => n.id !== newNotif.id))
+        dismissTimersRef.current.delete(newNotif.id)
       }, autoDismissDuration || 5000)
-      dismissTimersRef.current.set(notifWithKey.id, timer)
+      dismissTimersRef.current.set(newNotif.id, timer)
     })
     return () => {
       removeListener?.()

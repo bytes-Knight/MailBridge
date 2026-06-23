@@ -10,6 +10,7 @@ import { evictStaleNotifications } from './notification-dedup'
 import { logoResolver } from './logo-resolver'
 import { getIconDataUrl } from './icon-loader'
 import { IpcChannels } from '@shared/ipc'
+import { withTimeout } from '@shared/helpers'
 import type { MailAccount, NewEmailNotification, NotificationPopupState } from '@shared/types'
 
 export class NotificationService {
@@ -295,28 +296,6 @@ export class NotificationService {
     if (normalized.length > 260) return true
     return /\b(open navigation|all mail|drafts|sent|starred|archive|spam|trash|folders|labels|manage your folders|create a new folder|inbox drafts sent)\b/i.test(normalized)
   }
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
-  return new Promise(resolve => {
-    let settled = false
-    const timer = setTimeout(() => {
-      if (settled) return
-      settled = true
-      resolve(fallback)
-    }, timeoutMs)
-    promise.then(value => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(value)
-    }).catch(() => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(fallback)
-    })
-  })
 }
 
 export const notificationService = new NotificationService()

@@ -3,6 +3,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import { IpcChannels } from '@shared/ipc'
 import { PROTON_MAIL_URL } from '@shared/constants'
+import { withTimeout } from '@shared/helpers'
 import { logger } from '../services/logger'
 import { notificationService } from '../services/notification-service'
 import { storageService } from '../services/storage'
@@ -217,31 +218,6 @@ function buildNotificationKey(
   const subject = String(emailInfo?.subject || '').trim().toLowerCase()
   const snippet = String(emailInfo?.snippet || '').trim().toLowerCase()
   return [accountId, currentCount, sender, subject, snippet, Date.now()].filter(Boolean).join('|')
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
-  return new Promise(resolve => {
-    let settled = false
-    const timer = setTimeout(() => {
-      if (settled) return
-      settled = true
-      resolve(fallback)
-    }, timeoutMs)
-
-    promise
-      .then(value => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolve(value)
-      })
-      .catch(() => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolve(fallback)
-      })
-  })
 }
 
 function buildProtonNotification(

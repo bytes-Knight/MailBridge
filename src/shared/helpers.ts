@@ -105,3 +105,29 @@ export function throttle<T extends (...args: unknown[]) => void>(fn: T, limit: n
 export function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max)
 }
+
+/**
+ * Race a promise against a timeout. If the promise settles before the timeout,
+ * resolve with its value. Otherwise, resolve with the fallback.
+ */
+export function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  return new Promise(resolve => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      resolve(fallback)
+    }, timeoutMs)
+    promise.then(value => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }).catch(() => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(fallback)
+    })
+  })
+}

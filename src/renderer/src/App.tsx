@@ -24,6 +24,7 @@ export function App(): React.ReactElement {
   const [externalLinkUrl, setExternalLinkUrl] = useState<string | null>(null)
   const pendingLinkRef = useRef<string | null>(null)
 
+  // Initialize notification sound handler (sound playback managed by the hook)
   useNotifications()
 
   // Auto-start all Proton sessions in the background on startup

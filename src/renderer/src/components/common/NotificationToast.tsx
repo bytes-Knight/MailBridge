@@ -11,12 +11,8 @@ interface NotificationToastProps {
 
 export function NotificationToast({ notification, onDismiss, onNavigate, autoDismissDuration = 16000 }: NotificationToastProps): React.ReactElement {
   const [dismissed, setDismissed] = useState(false)
-  const [progress, setProgress] = useState(100)
-  const timerRef = useRef<ReturnType<typeof setInterval>>()
-  const onDismissRef = useRef(onDismiss)
-  const durationRef = useRef(autoDismissDuration)
-  onDismissRef.current = onDismiss
-  durationRef.current = autoDismissDuration
+  const dismissRef = useRef(onDismiss)
+  dismissRef.current = onDismiss
 
   const absoluteTime = new Date(notification.timestamp).toLocaleString(undefined, {
     month: 'short',
@@ -26,28 +22,18 @@ export function NotificationToast({ notification, onDismiss, onNavigate, autoDis
   })
 
   useEffect(() => {
-    const start = Date.now()
-    const notificationId = notification.id
-    timerRef.current = setInterval(() => {
-      const elapsed = Date.now() - start
-      const remaining = Math.max(0, 100 - (elapsed / durationRef.current) * 100)
-      setProgress(remaining)
-      if (remaining <= 0) {
-        if (timerRef.current) clearInterval(timerRef.current)
-        setDismissed(true)
-        setTimeout(() => onDismissRef.current(notificationId), 350)
-      }
-    }, 150)
+    const nid = notification.id
+    const timer = setTimeout(() => {
+      setDismissed(true)
+      setTimeout(() => dismissRef.current(nid), 300)
+    }, autoDismissDuration)
 
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current)
-    }
-  }, [notification.id])
+    return () => clearTimeout(timer)
+  }, [notification.id, autoDismissDuration])
 
   const handleDismiss = () => {
-    if (timerRef.current) clearInterval(timerRef.current)
     setDismissed(true)
-    setTimeout(() => onDismiss(notification.id), 350)
+    setTimeout(() => onDismiss(notification.id), 300)
   }
 
   const handleOpen = () => {
@@ -60,112 +46,75 @@ export function NotificationToast({ notification, onDismiss, onNavigate, autoDis
   const recipientEmail = notification.accountEmail || ''
   const senderName = notification.from.name || ''
   const senderAddress = notification.from.address || ''
-  const senderFull = senderName && senderAddress
-    ? `${senderName}`
+  const senderDisplay = senderName && senderAddress
+    ? senderName
     : (senderAddress || senderName || 'Proton Mail')
-  const senderEmailOnly = senderAddress || ''
-  const previewText = notification.snippet || notification.subject || ''
-  const providerAccentClass = `nt-accent-${notification.provider}`
-  const hasAttachments = notification.hasAttachments
-  const isStarred = notification.isStarred
+  // Only show snippet if it's different from the subject and non-empty,
+  // to avoid duplicating the subject line
+  const rawSnippet = notification.snippet || ''
+  const hasMeaningfulSnippet = rawSnippet &&
+    rawSnippet !== notification.subject &&
+    !notification.subject?.includes(rawSnippet) &&
+    rawSnippet.length > 3
+  const isStacked = false // feature flag for future stacked variant
+  const providerTag = notification.provider === 'proton' ? 'Proton' : 'Mail'
 
   return (
-    <section className={`nt-card ${dismissed ? 'dismissing' : ''} ${providerAccentClass}`} data-testid="notification-popup" data-provider={notification.provider} role="alert" aria-live="polite">
-      {/* Animated gradient glow border */}
-      <div className="nt-glow-border" aria-hidden="true" />
-
-      {/* Scan line overlay */}
-      <div className="nt-scanlines" aria-hidden="true" />
-
-      <div className="nt-shell">
-        {/* Holographic avatar with orbiting particles */}
-        <div className="nt-ring-wrap" aria-hidden="true">
-          <span className="nt-ring nt-ring-outer" />
-          <span className="nt-ring nt-ring-inner" />
-          <span className="nt-ring nt-ring-particle p1" />
-          <span className="nt-ring nt-ring-particle p2" />
-          <span className="nt-ring nt-ring-particle p3" />
-          <span className="nt-core nt-core-icon-only">
-            <img className="nt-core-image" src={notification.appIconUrl || ''} alt="MailBridge" />
-            <span className="nt-core-fallback">
-              {senderName.charAt(0).toUpperCase() || notification.provider.charAt(0).toUpperCase()}
-            </span>
-          </span>
+    <section
+      className={`nt-toast ${dismissed ? 'nt-toast--out' : ''} ${isStacked ? 'nt-toast--stacked' : ''}`}
+      data-testid="notification-popup"
+      data-provider={notification.provider}
+      role="alert"
+      aria-live="polite"
+    >
+      <div className="nt-toast-row">
+        <div className="nt-toast-icon-wrap" aria-hidden="true">
+          <div className="nt-toast-icon-box">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="2" y="4" width="20" height="16" rx="3" fill="white" fillOpacity="0.15" stroke="white" strokeWidth="1.5" />
+              <path d="M2 8l10 7 10-7" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </div>
+          <div className="nt-toast-icon-dot" />
         </div>
 
-        {/* Body */}
-        <div className="nt-body">
-          {/* Head row: recipient account + time */}
-          <div className="nt-head-row">
-            <span className="nt-recipient" title={recipientEmail}>
-              <span className="nt-recipient-dot" />
+        <div className="nt-toast-body">
+          <div className="nt-toast-head">
+            <span className="nt-toast-label" title={recipientEmail}>
               {recipientEmail || 'MailBridge'}
             </span>
-            <span className="nt-time" title={`Received ${absoluteTime}`}>
+            <span className="nt-toast-time" title={`Received ${absoluteTime}`}>
               {formatRelativeTime(notification.timestamp)}
             </span>
           </div>
 
-          {/* Clickable content area */}
-          <div className="nt-content" onClick={handleOpen}>
-            <div className="nt-sender-badge-row">
-              <span className="nt-sender-name">{senderFull || 'Unknown Sender'}</span>
-              {senderEmailOnly && senderName && (
-                <span className="nt-sender-email">{senderEmailOnly}</span>
-              )}
-            </div>
-            <h1 className="nt-subject">{notification.subject || 'New email received'}</h1>
-            {previewText && (
-              <p className="nt-preview-line" title={previewText}>
-                {previewText}
-              </p>
-            )}
+          <div className="nt-toast-sender">
+            {senderDisplay || 'Unknown Sender'}
           </div>
 
-          {/* Bottom row: provider badge + meta + actions */}
-          <div className="nt-bottom-row">
-            <div className="nt-meta-left">
-              <span className="nt-tag nt-tag-provider">
-                <span className="nt-tag-pulse" />
-                PROTON
-              </span>
-              {hasAttachments && (
-                <span className="nt-tag nt-tag-meta" title="Has attachments">
-                  <svg width="10" height="10" viewBox="0 0 16 16" fill="none">
-                    <path d="M14 8.5A5.5 5.5 0 0 1 3.5 8.5V4a3 3 0 0 1 6 0v5a1.5 1.5 0 0 1-3 0V5h1v4a.5.5 0 0 0 1 0V4a2 2 0 1 0-4 0v4.5a4.5 4.5 0 1 0 9 0V5h1v3.5Z" fill="currentColor"/>
-                  </svg>
-                </span>
-              )}
-              {isStarred && (
-                <span className="nt-tag nt-tag-meta nt-tag-starred" title="Starred">
-                  <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
-                    <path d="M8 2.943 6.525 5.573a.567.567 0 0 1-.393.278l-2.973.541 2.06 2.119c.117.12.173.286.15.45l-.39 2.924 2.777-1.282a.582.582 0 0 1 .486 0l2.777 1.282-.39-2.925a.542.542 0 0 1 .15-.45l2.06-2.118-2.973-.541a.567.567 0 0 1-.394-.278L8.498 1.788Z"/>
-                  </svg>
-                </span>
-              )}
-            </div>
-            <div className="nt-actions">
-              <button className="nt-btn nt-btn-default" onClick={handleDismiss}>
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-                  <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
-                </svg>
-                Dismiss
-              </button>
-              <button className="nt-btn nt-btn-primary" onClick={handleOpen}>
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-                  <path d="M2 4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4Z" stroke="currentColor" strokeWidth="1.2" fill="none"/>
-                  <path d="M2 4l6 4 6-4" stroke="currentColor" strokeWidth="1.2" fill="none"/>
-                </svg>
-                Open
-              </button>
-            </div>
+          <div className="nt-toast-preview" onClick={handleOpen}>
+            <span>{notification.subject || 'New email received'}</span>
+            {hasMeaningfulSnippet && (
+              <>
+                <span className="nt-toast-sep">·</span>
+                <span>{rawSnippet.split('\n')[0]}</span>
+              </>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Animated progress bar */}
-      <div className="nt-progress" style={{ width: `${progress}%` }}>
-        <div className="nt-progress-glow" />
+      <div className="nt-toast-footer">
+        <span className="nt-toast-badge">{providerTag}</span>
+
+        <div className="nt-toast-actions">
+            <button className="nt-toast-btn nt-toast-btn--secondary" onClick={handleDismiss}>
+            Dismiss
+          </button>
+          <button className="nt-toast-btn nt-toast-btn--primary" onClick={handleOpen}>
+            {notification.provider === 'proton' ? 'Open Proton Mail' : 'Open Email'}
+          </button>
+        </div>
       </div>
     </section>
   )
