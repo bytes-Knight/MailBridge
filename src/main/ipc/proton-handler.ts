@@ -1,15 +1,42 @@
-import { ipcMain, BrowserView, session, BrowserWindow, shell, dialog } from 'electron'
-import * as fs from 'fs'
-import * as path from 'path'
+import { app, ipcMain, session, BrowserView, BrowserWindow, shell } from 'electron'
 import { IpcChannels } from '@shared/ipc'
-import { PROTON_MAIL_URL } from '@shared/constants'
+import {
+  PROTON_MAIL_URL,
+  PROTON_USER_AGENT,
+  PROTON_SEC_CH_UA,
+  PROTON_SEC_CH_UA_PLATFORM,
+  PROTON_SEC_CH_UA_MOBILE,
+} from '@shared/constants'
 import { withTimeout } from '@shared/helpers'
 import { logger } from '../services/logger'
 import { notificationService } from '../services/notification-service'
 import { storageService } from '../services/storage'
 import type { NewEmailNotification } from '@shared/types'
 
-const sessions = new Map<string, { view: BrowserView; partition: string }>()
+/**
+ * Each Proton account runs inside its own Electron BrowserView that is
+ * attached to the MailBridge main window. This gives every account:
+ *   - A dedicated `webContents` (true per-account browser instance)
+ *   - A dedicated OS-level session / partition: `persist:proton-${accountId}`
+ *   - Independent title updates, page-title-updated events and notification
+ *   detection — so two accounts in different states can't leak into each other.
+ *
+ * BrowserView (rather than BrowserWindow) keeps the Proton content visually
+ * embedded inside the MailBridge window — exactly like before — while still
+ * passing the realistic Chrome 138 user-agent + Client Hints on every request
+ * so Proton can't tell apart MailBridge from a real Chrome browser.
+ *
+ * The user-agent override is the actual protection against Proton's
+ * multi-account heuristics: each session gets its own `setUserAgent` +
+ * `webRequest.onBeforeSendHeaders` setup below in `applyChromeFingerprint`,
+ * so Proton sees a coherent Windows-Chrome-138 fingerprint from each account
+ * even though they all live inside the same OS process.
+ */
+interface ProtonSession {
+  view: BrowserView
+  partition: string
+}
+const sessions = new Map<string, ProtonSession>()
 
 /** Periodic keep-alive timers for each Proton session to prevent logout. */
 const keepAliveTimers = new Map<string, ReturnType<typeof setInterval>>()
@@ -18,11 +45,153 @@ const keepAliveTimers = new Map<string, ReturnType<typeof setInterval>>()
 const mailboxSyncTimers = new Map<string, ReturnType<typeof setInterval>>()
 const backgroundSyncTimers = new Map<string, ReturnType<typeof setInterval>>()
 
+/**
+ * Tracks whether the main window is currently visible to the user. While the
+ * window is hidden (minimised or in the system tray) we disconnect the heavy
+ * DOM MutationObserver inside each Proton BrowserView — the worst single
+ * source of idle RAM in each renderer process. The 10-second mailbox-sync /
+ * refresh-button-click timer that lives in the main process keeps running
+ * uninterrupted on purpose, so the user-visible Proton refresh cadence is the
+ * same whether the window is in the tray or visible. Proton's own
+ * `page-title-updated` events continue to fire for notifications regardless.
+ */
+let isAppVisible = true
+let visibilityListenersAttached = false
+
 /** 10-second heartbeat — matches Proton project's PROTON_MAILBOX_REFRESH_HEARTBEAT_MS */
 const MAILBOX_SYNC_INTERVAL_MS = 10_000
 
 /** 15-minute background sync — matches Proton project's PROTON_BACKGROUND_SYNC_INTERVAL_MS */
 const BACKGROUND_SYNC_INTERVAL_MS = 15 * 60 * 1000
+
+/**
+ * Connect / disconnect lifecycle for the foreground↔background throttling system.
+ * Registered at app-level so `main-window.ts` can broadcast visibility changes
+ * through `app.emit('mailbridge:visibility', ...)` without taking a direct
+ * dependency on the Proton handler module.
+ */
+function registerVisibilityHandlers(): void {
+  // Idempotent guard — only attach the listener once even if this module is
+  // re-evaluated. We deliberately avoid `app.removeAllListeners(...)` so any
+  // future subscribers (telemetry, another service module) aren't wiped.
+  if (visibilityListenersAttached) return
+  visibilityListenersAttached = true
+  // NB: emitters in main-window.ts call `app.emit('mailbridge:visibility', 'visible'|'hidden')`
+  // with the state as the ONLY payload (matching Electron's EventEmitter convention so the
+  // single-arg signature here works as expected). Do NOT switch to a (_event, state)
+  // signature without also passing an event object from the emitters.
+  // Serial chain: queue visibility changes so back-to-back show/hide transitions
+  // don't race the async reconnect/disconnect observers inside each BrowserView.
+  // Without this, e.g. hide can disconnect a freshly-created observer that show
+  // was in the middle of installing. Awaiting the chain ensures each batch fully
+  // finishes before the next begins.
+  let visibilityChain: Promise<void> = Promise.resolve()
+  // Electron's App type only declares built-in events on its `on` overload.
+  // Cast through `unknown` to the wider `EventEmitter` shape so the custom
+  // 'mailbridge:visibility' event name compiles.
+  ;(app as unknown as NodeJS.EventEmitter).on('mailbridge:visibility', (state: 'visible' | 'hidden') => {
+    visibilityChain = visibilityChain
+      .then(() => applyVisibilityChange(state))
+      .catch(err => {
+        logger.warn('Visibility transition error', { error: String(err) })
+      })
+  })
+}
+
+async function applyVisibilityChange(state: 'visible' | 'hidden'): Promise<void> {
+  const next = state === 'visible'
+  if (next === isAppVisible) return
+  isAppVisible = next
+  logger.info('MailBridge visibility changed', { state })
+  if (next) {
+    // Coming back to foreground: reattach only the injected DOM MutationObserver
+    // inside each Proton BrowserView. We deliberately do NOT call
+    // `startMailboxSync(...)` here — the 10-second mailbox-sync timer (which
+    // drives the user-visible Proton refresh button click via runSyncTick ->
+    // clickRefreshButton) has been running the entire time the window was
+    // hidden and must continue without interruption when the window returns.
+    for (const [accountId, session_] of Array.from(sessions.entries())) {
+      try {
+        await reconnectProtonObserver(session_.view).catch(() => { /* ignore */ })
+      } catch (err) {
+        logger.warn('Failed to resume Proton observer on show', { accountId, error: String(err) })
+      }
+    }
+  } else {
+    // Going to background: disconnect only the injected DOM MutationObserver
+    // (the heaviest single source of idle RAM in each Proton BrowserView).
+    // We deliberately do NOT call `stopMailboxSync(...)` here — the 10-second
+    // mailbox-sync timer (which drives runSyncTick -> clickRefreshButton) must
+    // keep firing while the window is hidden so the user-visible Proton
+    // refresh cadence doesn't change just because they minimised the window
+    // to the tray. Proton's own `page-title-updated` events keep notifications
+    // flowing regardless.
+    for (const [accountId, session_] of Array.from(sessions.entries())) {
+      try {
+        await disconnectProtonObserver(session_.view).catch(() => { /* ignore */ })
+      } catch (err) {
+        logger.warn('Failed to pause Proton observer on hide', { accountId, error: String(err) })
+      }
+    }
+    // Hint V8 to release anything we won't need soon (main-heap only; renderer
+    // heaps are managed by their own processes).
+    if (global.gc && typeof global.gc === 'function') {
+      try { global.gc() } catch { /* ignore */ }
+    }
+  }
+}
+
+/**
+ * Disconnect the injected DOM MutationObserver inside a Proton BrowserView without
+ * tearing down the view itself. Proton page-title-updated events still fire
+ * for notifications because the web contents remain alive.
+ */
+async function disconnectProtonObserver(view: BrowserView): Promise<void> {
+  if (!view.webContents || view.webContents.isDestroyed()) return
+  await view.webContents.executeJavaScript(
+    `(() => {
+       try {
+         if (window.__mailbridgeObserver) {
+           window.__mailbridgeObserver.disconnect();
+         }
+         // NOTE: we deliberately do NOT touch the in-page periodic setInterval
+         // (10s cadence) inside Proton — it keeps running so the
+         // row-extraction cadence matches the main-process mailbox sync, and
+         // the user-visible Proton refresh click keeps firing at 10s whether
+         // the main window is hidden or not.
+       } catch (e) { /* page context might be torn down */ }
+     })()`
+  ).catch(() => { /* page might not be ready */ })
+}
+
+/**
+ * Reconnect the observer (or create a fresh one) inside a Proton BrowserView.
+ * Called whenever the foreground status flips back to visible.
+ */
+async function reconnectProtonObserver(view: BrowserView): Promise<void> {
+  if (!view.webContents || view.webContents.isDestroyed()) return
+  // First try the lightweight in-place restart exposed by the injected script.
+  const restarted = await view.webContents.executeJavaScript(
+    `(() => {
+       try {
+         if (window.__mailbridgeRestartObserver) {
+           window.__mailbridgeRestartObserver();
+           return true;
+         }
+         return false;
+       } catch (e) { return false; }
+     })()`
+  ).catch(() => false)
+  // If the script hasn't been injected yet (e.g. user just added an account while
+  // the window was hidden), fall back to a full re-injection.
+  if (restarted !== true) {
+    injectMailboxObserver(view)
+  }
+  // NOTE: we deliberately do NOT call window.__mailbridgeRestartPeriodic — the
+  // injected-script's periodic timer was never stopped by disconnectProtonObserver
+  // (so the 10-second row-extraction cadence matches the user-visible refresh
+  // cadence regardless of window visibility).
+}
 
 /** Track last known unread count per account for notification detection. */
 const lastUnreadCounts = new Map<string, number>()
@@ -89,16 +258,102 @@ function hasDangerousProtocol(url: string): boolean {
 }
 
 /**
- * Send an external link confirmation request to the renderer.
- * Returns true if the user confirmed, false otherwise.
+ * Find the MailBridge main window, which is marked with the
+ * `__isMainWindow` flag in `main-window.ts`. This is the window every
+ * per-account Proton BrowserView will be attached to and detached from,
+ * so the user always sees Proton content inside the MailBridge UI but
+ * with each account in its own isolated session.
+ *
+ * Falls back to `BrowserWindow.getFocusedWindow()` and any focused window
+ * with no parent of its own.
  */
+function findMainWindow(): BrowserWindow | null {
+  const all = BrowserWindow.getAllWindows()
+  for (const w of all) {
+    if ((w as any).__isMainWindow === true) return w
+  }
+  // First fallback: any window with no parent of its own is the root window.
+  for (const w of all) {
+    try {
+      if (!w.getParentWindow()) return w
+    } catch {
+      // ignore — destroyed window
+    }
+  }
+  // Last fallback: whatever is focused right now.
+  return BrowserWindow.getFocusedWindow() ?? null
+}
+
+/**
+ * Apply realistic Client Hints headers to every request leaving a Proton
+ * session. Proton (and many other modern sites) now verify these against
+ * the User-Agent to fingerprint browsers; without matching hints, the
+ * request looks suspicious even if the UA looks fine.
+ *
+ * Calling `setUserAgent` on the Electron Session is what makes the
+ * User-Agent header look real. We do both — session-level UA override +
+ * request-level Client Hints — so anyone checking either signal sees a
+ * consistent Windows-Chrome-138 fingerprint.
+ */
+function isProtonHost(url: string): boolean {
+  try {
+    const host = new URL(url).hostname
+    return (
+      host === 'proton.me' || host.endsWith('.proton.me') ||
+      host === 'protonmail.com' || host.endsWith('.protonmail.com') ||
+      host === 'protonvpn.com' || host.endsWith('.protonvpn.com')
+    )
+  } catch {
+    return false
+  }
+}
+
+function applyChromeFingerprint(s: Electron.Session): void {
+  try {
+    s.setUserAgent(PROTON_USER_AGENT)
+  } catch {
+    // session may already be torn down — ignore
+  }
+  try {
+    s.webRequest.onBeforeSendHeaders((details, callback) => {
+      const headers = details.requestHeaders ?? {}
+      headers['Sec-CH-UA'] = PROTON_SEC_CH_UA
+      headers['Sec-CH-UA-Mobile'] = PROTON_SEC_CH_UA_MOBILE
+      headers['Sec-CH-UA-Platform'] = PROTON_SEC_CH_UA_PLATFORM
+      // Drop the language/ECMascript hints Chromium normally sends, since
+      // some sites flag them when they disagree with the rest of the fingerprint.
+      // When "Block third-party cookies" is enabled, also strip cookies from
+      // requests to non-Proton (third-party) hosts. The setting is read live
+      // per request, so toggling it takes effect immediately.
+      if (storageService.getSettings().blockThirdPartyCookies && !isProtonHost(details.url)) {
+        delete headers['Cookie']
+      }
+      callback({ requestHeaders: headers })
+    })
+  } catch {
+    // webRequest may already be hooked — ignore
+  }
+  try {
+    // Block third-party cookies: don't accept Set-Cookie from non-Proton hosts.
+    s.webRequest.onHeadersReceived((details, callback) => {
+      const responseHeaders = details.responseHeaders ?? {}
+      if (storageService.getSettings().blockThirdPartyCookies && !isProtonHost(details.url)) {
+        delete responseHeaders['set-cookie']
+      }
+      callback({ responseHeaders })
+    })
+  } catch {
+    // webRequest may already be hooked — ignore
+  }
+}
+
 /**
  * Send an external link confirmation request to the renderer.
  * Returns true if the user confirmed, false otherwise.
  * Automatically confirms for domains the user has marked as trusted.
  */
 async function confirmExternalLink(url: string): Promise<boolean> {
-  const mainWindow = BrowserWindow.getFocusedWindow()
+  const mainWindow = findMainWindow()
   if (!mainWindow) return false
 
   // Check if the URL's hostname is in the trusted domains list
@@ -140,15 +395,18 @@ async function confirmExternalLink(url: string): Promise<boolean> {
 }
 
 /**
- * Set up external link handling on a Proton BrowserView:
+ * Set up external link handling on a Proton BrowserWindow's webContents:
  * - Intercept will-navigate for link clicks within the page
  * - Intercept new-window for target=_blank links
  * - Show confirmation dialog for external URLs
  * - Open confirmed URLs in the system's default browser
  */
 function setupExternalLinkHandler(view: BrowserView): void {
+  const web = view.webContents
+  if (!web || web.isDestroyed()) return
+
   // Handler for in-page navigation (normal link clicks, redirects)
-  view.webContents.on('will-navigate', (event, url) => {
+  web.on('will-navigate', (event, url) => {
     // Allow trusted Proton URLs to navigate normally
     if (isTrustedProtonUrl(url)) return
 
@@ -172,7 +430,7 @@ function setupExternalLinkHandler(view: BrowserView): void {
   })
 
   // Handler for new window requests (target="_blank", window.open)
-  view.webContents.setWindowOpenHandler(({ url }) => {
+  web.setWindowOpenHandler(({ url }) => {
     // Block dangerous protocols outright
     if (hasDangerousProtocol(url)) {
       logger.warn('Blocked dangerous URL from new-window', { url })
@@ -185,8 +443,6 @@ function setupExternalLinkHandler(view: BrowserView): void {
     }
 
     // For external URLs, show confirmation and open in system browser
-    // We need to do this asynchronously, so we'll confirm synchronously here
-    // and open via shell if the user accepts
     confirmExternalLink(url).then(confirmed => {
       if (confirmed) {
         shell.openExternal(url).catch(err => {
@@ -269,10 +525,8 @@ function notifyForProtonMail(
 }
 
 /**
- * Inject a content script into the Proton webview that overrides the
- * Notification API to capture Proton's own notification data (sender + subject).
- * This is far more reliable than querying the DOM for specific class names,
- * since Proton Mail uses obfuscated, dynamically-generated CSS classes.
+ * Pull the most recent unread row out of the Proton Mail inbox DOM, plus any
+ * captured browser-notification payload from the patched Notification API.
  */
 async function fetchLatestUnreadEmail(view: BrowserView, accountId: string): Promise<ProtonEmailInfo | null> {
   try {
@@ -365,7 +619,7 @@ async function fetchLatestUnreadEmail(view: BrowserView, accountId: string): Pro
           const hasMeaningfulSubject = subject.length > 0 && !/^(proton mail|new email received|new message received|new message in proton mail|\(no subject\))$/i.test(subject)
 
           if (hasMeaningfulSubject || hasMeaningfulSender) {
-            
+
             return {
               sender: hasMeaningfulSender ? sender : (sender || 'New Email'),
               senderEmail: senderEmail,
@@ -676,11 +930,12 @@ function cleanCapturedText(value: string): string {
 }
 
 /**
- * Inject a script into the Proton webview that monkey-patches the
+ * Inject a script into the Proton window that monkey-patches the
  * Notification constructor. This runs once after the page loads,
  * capturing Proton Mail's own notification data (sender name, subject).
  */
 function injectNotificationInterceptor(view: BrowserView): void {
+  if (!view.webContents || view.webContents.isDestroyed()) return
   view.webContents.executeJavaScript(`
     (function() {
       // Skip if already injected
@@ -695,7 +950,7 @@ function injectNotificationInterceptor(view: BrowserView): void {
 
         // Skip capturing non-email notifications (UI action toasts like "Star conversation",
         // "Conversation starred", "Message deleted", etc.) so we don't pick up stale data.
-        if (/\b(star|unstar|moved|deleted|removed|archived|trashed)\b/i.test(sender)) {
+        if (/\\b(star|unstar|moved|deleted|removed|archived|trashed)\\b/i.test(sender)) {
           return new OrigNotification(title, options);
         }
 
@@ -706,9 +961,9 @@ function injectNotificationInterceptor(view: BrowserView): void {
         var senderEmail = '';
 
         // Try to split body into subject and preview
-        // Proton uses actual newline characters (\n) to separate subject from snippet
-        if (body.indexOf('\\n') >= 0) {
-          var parts = body.split('\\n');
+        // Proton uses actual newline characters (\\n) to separate subject from snippet
+        if (body.indexOf('\\\\n') >= 0) {
+          var parts = body.split('\\\\n');
           subject = (parts[0] || '').trim();
           snippet = parts.slice(1).join(' ').trim().substring(0, 200);
         }
@@ -726,7 +981,7 @@ function injectNotificationInterceptor(view: BrowserView): void {
             senderEmail = senderEmailMatch[0];
             // If sender was just an email, try to extract name from options
             if (sender === senderEmail && options && options.body) {
-              sender = options.body.split('\\n')[0] || sender;
+              sender = options.body.split('\\\\n')[0] || sender;
             }
           }
         }
@@ -761,22 +1016,13 @@ function injectNotificationInterceptor(view: BrowserView): void {
 }
 
 /**
- * Inject a mailbox observer into the Proton webview, faithfully ported from
- * the Proton project's protonMailboxObserver.ts.
- *
- * Features:
- * - MutationObserver on document.documentElement (childList+subtree+attributes)
- * - Two-pass row collection: explicit selectors (data-proton-thread, etc.) then generic fallback
- * - Row deduplication by spatial coordinates
- * - Row validation: visibility, dimensions, excluded regions, date signals
- * - Sender/subject/snippet extraction with multi-strategy heuristics
- * - Unread inference via aria-label or font-weight
- * - Periodic sync every 10s
- * - Exposes __mailbridgeMailboxSyncNow() for gentle manual refresh
- * - Stores extracted items in window.__mailbridgeLastMailboxItems
- * - Cleanup on beforeunload
+ * Inject a MutationObserver-based mailbox observer into the Proton window.
+ * Mirrors `protonMailboxObserver.ts` from the Proton Mail Companion project
+ * — extracts sender/subject/snippet rows, dedupes by bounding rect, and
+ * exposes `__mailbridgeMailboxSyncNow()` for gentle manual refresh.
  */
 function injectMailboxObserver(view: BrowserView): void {
+  if (!view.webContents || view.webContents.isDestroyed()) return
   view.webContents.executeJavaScript(`
     (function() {
       // ── Guard ─────────────────────────────────────────────────────
@@ -792,7 +1038,7 @@ function injectMailboxObserver(view: BrowserView): void {
       // ── Helpers ───────────────────────────────────────────────────
       function extractText(el) {
         if (!el) return '';
-        return (el.textContent || '').replace(/\s+/g, ' ').trim();
+        return (el.textContent || '').replace(/\\s+/g, ' ').trim();
       }
 
       function extractHref(el) {
@@ -804,9 +1050,9 @@ function injectMailboxObserver(view: BrowserView): void {
 
       function normalizeBlockText(text) {
         return text
-          .replace(/[\s\u200B\u200C\u200D\uFEFF]+/g, ' ')
-          .replace(/^\s+|\s+$/g, '')
-          .replace(/\s{2,}/g, ' ');
+          .replace(/[\\s\\u200B\\u200C\\u200D\\uFEFF]+/g, ' ')
+          .replace(/^\\s+|\\s+$/g, '')
+          .replace(/\\s{2,}/g, ' ');
       }
 
       // ── Heuristics ────────────────────────────────────────────────
@@ -835,31 +1081,31 @@ function injectMailboxObserver(view: BrowserView): void {
         var text = extractText(el);
         if (!text) return false;
         // Common relative date patterns
-        if (/^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\s*(ago)?$/i.test(text)) return true;
+        if (/^(\\d+)\\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\\s*(ago)?$/i.test(text)) return true;
         // Date patterns like "Jan 15", "Jan 15, 2024", "01/15", "15 Jan"
-        if (/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}(,?\s+\d{4})?\b/i.test(text)) return true;
+        if (/\\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{1,2}(,?\\s+\\d{4})?\\b/i.test(text)) return true;
         // Time patterns like "10:30 AM", "14:30"
-        if (/\b\d{1,2}:\d{2}\s*(AM|PM)?\b/i.test(text)) return true;
+        if (/\\b\\d{1,2}:\\d{2}\\s*(AM|PM)?\\b/i.test(text)) return true;
         return false;
       }
 
       function isLikelyMailboxIdentityText(text) {
         if (!text) return false;
         // Email addresses
-        if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) return true;
+        if (/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(text)) return true;
         // Name patterns (not pure numbers, not dates, not very short)
-        if (/^\d+$/.test(text)) return false;
-        if (/^\d{1,2}:\d{2}/.test(text)) return false;
+        if (/^\\d+$/.test(text)) return false;
+        if (/^\\d{1,2}:\\d{2}/.test(text)) return false;
         if (text.length < 2) return false;
-        if (/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i.test(text) && /\d/.test(text)) return false;
+        if (/\\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\b/i.test(text) && /\\d/.test(text)) return false;
         return true;
       }
 
       function isLikelyDateText(text) {
         if (!text) return false;
-        if (/^(\d+)\s*(m|min|h|hr|d|day)\s*ago$/i.test(text.trim())) return true;
-        if (/^\d{1,2}:\d{2}\s*(AM|PM)?$/i.test(text.trim())) return true;
-        if (/^\d{1,2}\/\d{1,2}(\/\d{2,4})?$/.test(text.trim())) return true;
+        if (/^(\\d+)\\s*(m|min|h|hr|d|day)\\s*ago$/i.test(text.trim())) return true;
+        if (/^\\d{1,2}:\\d{2}\\s*(AM|PM)?$/i.test(text.trim())) return true;
+        if (/^\\d{1,2}\\/\\d{1,2}(\\/\\d{2,4})?$/.test(text.trim())) return true;
         return false;
       }
 
@@ -873,7 +1119,7 @@ function injectMailboxObserver(view: BrowserView): void {
           lower === 'updates' || lower === 'forums' || lower === 'promotions' ||
           lower === 'label' || lower === 'proton' || lower === 'sent' ||
           lower === 'draft' || lower === 'drafts' ||
-          /^\d+\s*-\s*\d+\s+of\s+\d+$/i.test(normalized) ||
+          /^\\d+\\s*-\\s*\\d+\\s+of\\s+\\d+$/i.test(normalized) ||
           (normalized === normalized.toUpperCase() && normalized.length > 1 && normalized.length < 15)
         );
       }
@@ -892,8 +1138,8 @@ function injectMailboxObserver(view: BrowserView): void {
             p = p.parentElement;
           }
           if (inSvg) continue;
-          var t = (node.textContent || '').replace(/\s+/g, ' ').trim();
-          if (t.length > 1 && !/^[\s\d\s]*$/.test(t)) {
+          var t = (node.textContent || '').replace(/\\s+/g, ' ').trim();
+          if (t.length > 1 && !/^[\\s\\d\\s]*$/.test(t)) {
             // Skip separator-only lines and metadata blocks
             if (isSeparatorOnlyLine(t)) continue;
             var blockText = normalizeBlockText(t);
@@ -906,8 +1152,11 @@ function injectMailboxObserver(view: BrowserView): void {
 
       function inferUnread(el) {
         if (!el) return false;
+        // Proton's current mailbox UI renders an .item-unread-dot element only
+        // on unread rows — the most reliable unread signal in the 2026 layout.
+        if (el.querySelector('.item-unread-dot')) return true;
         var label = el.getAttribute('aria-label') || '';
-        if (/\bunread\b/i.test(label)) return true;
+        if (/\\bunread\\b/i.test(label)) return true;
         // Check font-weight on child elements
         var spans = el.querySelectorAll('span, b, strong');
         for (var i = 0; i < spans.length; i++) {
@@ -918,7 +1167,9 @@ function injectMailboxObserver(view: BrowserView): void {
       }          // ── Row extraction ────────────────────────────────────────────
       function toSummary(row) {
         try {
-          var id = row.getAttribute('data-proton-thread') || row.getAttribute('data-message-id') || '';
+          var id = row.getAttribute('data-proton-thread') ||
+                   row.getAttribute('data-message-id') ||
+                   row.getAttribute('data-element-id') || '';
           var textBlocks = getMeaningfulTextBlocks(row);
           var dateEl = row.querySelector('[datetime], [data-timestamp]');
           var dateText = dateEl ? extractText(dateEl) : '';
@@ -929,6 +1180,34 @@ function injectMailboxObserver(view: BrowserView): void {
           var subject = '';
           var snippet = '';
           var senderEmail = '';
+
+          // ── Structured extraction (Proton's current 2026 mailbox UI) ──
+          // The new layout exposes sender/subject/date as explicit columns
+          // with stable data-testid attributes; prefer those over heuristics.
+          var senderCol = row.querySelector('[data-testid="message-row:sender-address"]');
+          if (senderCol) {
+            sender = extractText(senderCol);
+          }
+          var senderEmailCol = row.querySelector('[data-testid="message-column:sender-address"]');
+          if (senderEmailCol) {
+            var emailFromTitle = senderEmailCol.getAttribute('title') || '';
+            if (/[\\w.+-]+@[\\w-]+\\.[\\w.]+/.test(emailFromTitle)) {
+              senderEmail = emailFromTitle;
+            }
+          }
+          var subjectCol = row.querySelector('[data-testid="message-row:subject"]');
+          if (subjectCol) {
+            var rawSubject = subjectCol.getAttribute('title') || extractText(subjectCol);
+            // Strip conversation-count prefixes like "[3]" / "3 messages in conversation"
+            subject = String(rawSubject)
+              .replace(/^\\s*\\[\\d+\\]\\s*/, '')
+              .replace(/^\\d+\\s+messages in conversation\\s*/i, '')
+              .trim();
+          }
+          var dateCol = row.querySelector('[data-testid="item-date-simple"]');
+          if (dateCol) {
+            dateText = extractText(dateCol) || dateText;
+          }
 
           // Strategy: find identity texts, skip dates and metadata
           var identityTexts = textBlocks.filter(function(t) {
@@ -942,7 +1221,7 @@ function injectMailboxObserver(view: BrowserView): void {
               senderEmail = emailMatch[0];
               // If the text is just an email, use it as both sender and email
               if (emailMatch[0] === identityTexts[k].trim()) {
-                identityTexts[k] = identityTexts[k].replace(emailMatch[0], '').replace(/[<>()\[\]]/g, '').trim();
+                identityTexts[k] = identityTexts[k].replace(emailMatch[0], '').replace(/[<>()\\[\\]]/g, '').trim();
               }
               break;
             }
@@ -968,10 +1247,10 @@ function injectMailboxObserver(view: BrowserView): void {
             if (genericMatch) senderEmail = genericMatch[0];
           }
 
-          if (identityTexts.length >= 1) {
+          if (!sender && identityTexts.length >= 1) {
             sender = identityTexts[0];
           }
-          if (identityTexts.length >= 2) {
+          if (!subject && identityTexts.length >= 2) {
             subject = identityTexts[1];
           }
           if (identityTexts.length >= 3) {
@@ -979,7 +1258,9 @@ function injectMailboxObserver(view: BrowserView): void {
           } else {
             // Fallback: use remaining text blocks after subject
             var remaining = textBlocks.slice(identityTexts.length);
-            remaining = remaining.filter(function(t) { return !isLikelyDateText(t); });
+            remaining = remaining.filter(function(t) {
+              return !isLikelyDateText(t) && t !== sender && t !== subject;
+            });
             if (remaining.length > 0) {
               snippet = remaining.join(' ');
             }
@@ -1037,7 +1318,7 @@ function injectMailboxObserver(view: BrowserView): void {
           var href = extractHref(el);
           if (!href) return false;
 
-          return hasDateSignal(el) && /\/mail|\/inbox|message/i.test(href);
+          return hasDateSignal(el) && /\\/mail|\\/inbox|message/i.test(href);
         } catch(e) {
           return false;
         }
@@ -1045,7 +1326,7 @@ function injectMailboxObserver(view: BrowserView): void {
 
       // ── Separator-only line detection ────────────────────────────
       function isSeparatorOnlyLine(text) {
-        var normalized = (text || '').replace(/\s+/g, '');
+        var normalized = (text || '').replace(/\\s+/g, '');
         return normalized.length > 0 && /^[+*_=#~^|<>\-]{5,}$/.test(normalized);
       }
 
@@ -1085,6 +1366,9 @@ function injectMailboxObserver(view: BrowserView): void {
         var explicitSelectors = [
           '[data-proton-companion-thread]',
           '[data-proton-thread]',
+          // Proton's current mailbox UI marks each row with
+          // data-testid="message-item:<subject>"
+          '[data-testid^="message-item"]',
           '[data-testid*="message-row" i]',
           '[data-testid*="conversation-row" i]',
           '[data-testid*="thread-row" i]',
@@ -1129,7 +1413,7 @@ function injectMailboxObserver(view: BrowserView): void {
         try {
           var pathname = window.location.pathname;
           // Normalize: remove trailing slash
-          var normalized = pathname.replace(/\/+$/, '');
+          var normalized = pathname.replace(/\\/+$/, '');
           // Only auto-refresh when on the exact inbox root, not sub-views like /inbox/conversation/...
           return normalized.endsWith('/inbox');
         } catch(e) { return false; }
@@ -1161,25 +1445,23 @@ function injectMailboxObserver(view: BrowserView): void {
           window.__mailbridgeLastMailboxUnread = items.filter(function(it) { return it.unread; }).length;
           window.__mailbridgeLastSync = Date.now();
 
-          // Also try clicking Proton's refresh button for gentle refresh
-          // The refresh icon is an SVG with data-testid="navigation-link:refresh-folder"
-          // The SVG itself has a 'hidden' class — we need to find the parent <button> element
-          try {
-            var refreshBtn = document.querySelector(
-              '[data-testid="navigation-link:refresh-folder"], ' +
-              '[title*="Refresh" i], ' +
-              '[data-testid*="refresh" i], ' +
-              '[class*="refresh" i], ' +
-              '[icon*="refresh" i]'
-            );
-            if (refreshBtn) {
-              // If it's not a button, find the closest button parent (the SVG lives inside a button)
-              var clickTarget = refreshBtn.tagName === 'BUTTON' ? refreshBtn : refreshBtn.closest('button');
-              if (!clickTarget) clickTarget = refreshBtn;
-              // Dispatch a real MouseEvent with isTrusted=true behavior via executeJavaScript
-              clickTarget.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-            }
-          } catch(e) {}
+          // NOTE: do NOT click Proton's refresh button from in here.
+          //
+          // Earlier versions of this observer dispatched a synthetic click on
+          // the refresh icon inside syncMailbox(). Clicking the icon caused a
+          // DOM mutation (spinner, status row update, etc.) which immediately
+          // re-triggered this same MutationObserver -- and because the click
+          // path doesn't pass through the 120ms debounce cleanly between
+          // back-to-back frames, the observer ended up firing the click in an
+          // effective tight loop: click -> DOM change -> observer -> click ->
+          // DOM change -> ... The user reported it as the "refresh button
+          // pressing continuously, every 10 second delay is gone".
+          //
+          // The 10-second-cadence click on the Proton refresh button is now
+          // handled exclusively from the main process via runSyncTick ->
+          // clickRefreshButton(view). This observer is only responsible for
+          // reading the mailbox DOM (extracting sender/subject/snippet rows)
+          // and reporting it back to main.
 
           // Keep syncing status visible for at least 2 seconds (async refresh)
           if (window.__mailbridgeSyncTimer) clearTimeout(window.__mailbridgeSyncTimer);
@@ -1208,7 +1490,45 @@ function injectMailboxObserver(view: BrowserView): void {
         // Observer start failed, use periodic only
       }
 
+      // ── Expose observer + restart hooks so the main process can disconnect
+      //    everything when the MailBridge window is hidden, then reopen the
+      //    observer when it's shown again. This avoids a 10-second DOM
+      //    scan across the entire Proton Mail document tree while the user
+      //    isn't even looking at MailBridge.
+      try {
+        window.__mailbridgeObserver = observer;
+        // Expose only the in-place restart hook the main process needs to
+        // re-attach the DOM MutationObserver on visibility-show. The 10-second
+        // periodic sync timer ('periodicTimer' below) is deliberately never
+        // stopped/restarted by the main process, so no helper for that is
+        // needed here.
+        window.__mailbridgeRestartObserver = function() {
+          try {
+            if (observer) observer.disconnect();
+          } catch (e) { /* ignore */ }
+          observer = new MutationObserver(function() {
+            if (syncTimer) clearTimeout(syncTimer);
+            syncTimer = setTimeout(syncMailbox, MUTATION_SYNC_DELAY_MS);
+          });
+          try {
+            observer.observe(document.documentElement, {
+              childList: true,
+              subtree: true,
+              attributes: true,
+              characterData: false
+            });
+          } catch (e) { /* ignore */ }
+          window.__mailbridgeObserver = observer;
+        };
+      } catch (e) {
+        // Page context might restrict assignment to window — ignore
+      }
+
       // ── Periodic sync ────────────────────────────────────────────
+      // The 10-second periodic timer below is INTENTIONALLY never stopped or
+      // restarted by the main process. It runs whether the MailBridge window
+      // is hidden or visible so the row-extraction cadence inside Proton
+      // matches the user-visible 10-second refresh click cadence.
       periodicTimer = setInterval(syncMailbox, PERIODIC_SYNC_INTERVAL_MS);
 
       // ── Manual sync trigger ───────────────────────────────────────
@@ -1239,6 +1559,8 @@ function injectMailboxObserver(view: BrowserView): void {
         if (periodicTimer) clearInterval(periodicTimer);
         if (window.__mailbridgeSyncTimer) clearTimeout(window.__mailbridgeSyncTimer);
         window.__mailbridgeObserverInjected = false;
+        window.__mailbridgeObserver = null;
+        window.__mailbridgeRestartObserver = null;
         window.__mailbridgeMailboxSyncNow = null;
         window.__mailbridgeLastMailboxItems = null;
         window.__mailbridgeLastMailboxSenders = null;
@@ -1248,9 +1570,20 @@ function injectMailboxObserver(view: BrowserView): void {
   `).catch(function() { /* page might not be ready yet, ignore */ });
 }
 
+/** Tracks whether each Proton session was observed on a logged-in mailbox page. */
+const wasLoggedInSessions = new Map<string, boolean>()
+
+function isLoggedInUrl(url: string): boolean {
+  return url.includes('/inbox') || url.includes('/mail') || url.includes('/conversations')
+}
+
 /**
  * Start a periodic keep-alive ping for a Proton session.
  * Pings every 4 minutes to keep the session from being marked as inactive.
+ *
+ * A transient failure (page navigating, renderer busy) must NOT kill the
+ * keep-alive — otherwise the session silently goes inactive until the user
+ * manually reopens the account. Only stop when the view is truly gone.
  */
 function startKeepAlive(accountId: string, view: BrowserView): void {
   // Clear any existing timer first
@@ -1258,11 +1591,39 @@ function startKeepAlive(accountId: string, view: BrowserView): void {
 
   const timer = setInterval(() => {
     try {
-      view.webContents.executeJavaScript('void(0)', false).catch(() => {
+      if (view.webContents && !view.webContents.isDestroyed()) {
+        view.webContents.executeJavaScript('void(0)', false).catch(() => {
+          if (view.webContents.isDestroyed()) {
+            stopKeepAlive(accountId)
+          }
+        })
+      } else {
         stopKeepAlive(accountId)
-      })
+      }
     } catch {
-      stopKeepAlive(accountId)
+      if (!view.webContents || view.webContents.isDestroyed()) {
+        stopKeepAlive(accountId)
+      }
+    }
+
+    // If Proton dropped the session to a login/landing page (inactivity
+    // timeout, expired session), reload the mailbox URL so the persisted
+    // cookies re-establish the session instead of sitting logged out.
+    try {
+      const url = view.webContents.getURL()
+      if (isLoggedInUrl(url)) {
+        wasLoggedInSessions.set(accountId, true)
+      } else if (
+        wasLoggedInSessions.get(accountId) &&
+        url &&
+        !view.webContents.isLoading() &&
+        !url.includes('account.proton.me')
+      ) {
+        logger.info('Proton session dropped to non-mailbox page — reloading to keep active', { accountId, url })
+        view.webContents.loadURL(PROTON_MAIL_URL)
+      }
+    } catch {
+      // View may be mid-destruction; ignore
     }
   }, 4 * 60 * 1000)
 
@@ -1283,6 +1644,8 @@ function stopKeepAlive(accountId: string): void {
  */
 async function clickRefreshButton(view: BrowserView): Promise<void> {
   try {
+    if (!view.webContents || view.webContents.isDestroyed()) return
+
     // Get the refresh button coordinates from the page
     const coords = await view.webContents.executeJavaScript(`
       (function() {
@@ -1297,7 +1660,7 @@ async function clickRefreshButton(view: BrowserView): Promise<void> {
           var buttons = document.querySelectorAll('button');
           for (var i = 0; i < buttons.length; i++) {
             if (buttons[i].querySelector('svg[data-testid="navigation-link:refresh-folder"]') ||
-                buttons[i].querySelector('[data-testid*="refresh"]') || 
+                buttons[i].querySelector('[data-testid*="refresh"]') ||
                 buttons[i].querySelector('[class*="reload-spinner"]') ||
                 buttons[i].querySelector('[class*="reload"]') ||
                 buttons[i].querySelector('[aria-label*="Refresh"]')) {
@@ -1315,8 +1678,8 @@ async function clickRefreshButton(view: BrowserView): Promise<void> {
         }
         return null;
       })()
-    `);
-    
+    `)
+
     if (coords) {
       // Simulate real mouse press and release using trusted input events
       await view.webContents.sendInputEvent({
@@ -1325,16 +1688,16 @@ async function clickRefreshButton(view: BrowserView): Promise<void> {
         y: coords.y,
         button: 'left',
         clickCount: 1
-      });
+      })
       // Small delay between mousedown and mouseup to mimic real user behavior
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, 50))
       await view.webContents.sendInputEvent({
         type: 'mouseUp',
         x: coords.x,
         y: coords.y,
         button: 'left',
         clickCount: 1
-      });
+      })
     }
   } catch {
     // Ignore errors - page might not be ready
@@ -1342,11 +1705,12 @@ async function clickRefreshButton(view: BrowserView): Promise<void> {
 }
 
 /**
- * Check if the Proton webview is currently on the inbox root view.
+ * Check if the Proton window is currently on the inbox root view.
  * Only auto-refresh when on the exact inbox — skip sub-views like /inbox/conversation/..., /inbox/message/..., etc.
  */
 async function isOnInboxView(view: BrowserView): Promise<boolean> {
   try {
+    if (!view.webContents || view.webContents.isDestroyed()) return false
     const url = view.webContents.getURL()
     try {
       const parsed = new URL(url)
@@ -1367,7 +1731,6 @@ async function isOnInboxView(view: BrowserView): Promise<boolean> {
 /**
  * Start a periodic 10-second mailbox sync (heartbeat) that calls
  * __mailbridgeMailboxSyncNow to gently refresh Proton's mailbox view.
- * This matches the Proton project's PROTON_MAILBOX_REFRESH_HEARTBEAT_MS = 10s.
  * Auto-refresh only runs when the user is on the inbox view.
  */
 function startMailboxSync(accountId: string, view: BrowserView): void {
@@ -1375,6 +1738,10 @@ function startMailboxSync(accountId: string, view: BrowserView): void {
 
   const runSyncTick = () => {
     try {
+      if (!view.webContents || view.webContents.isDestroyed()) {
+        stopMailboxSync(accountId)
+        return
+      }
       // First, sync the mailbox data via injected observer
       view.webContents.executeJavaScript(`
         (function() {
@@ -1383,9 +1750,11 @@ function startMailboxSync(accountId: string, view: BrowserView): void {
           }
         })();
       `).catch(() => {
-        stopMailboxSync(accountId)
+        // Transient failures (navigation, busy renderer) must not kill the
+        // heartbeat — retry on the next tick instead.
+        logger.debug('Mailbox sync tick failed — will retry next tick', { accountId })
       })
-      
+
       // Only click the refresh button if on the inbox view
       // Skip when viewing conversations, settings, or any other folder
       isOnInboxView(view).then((onInbox) => {
@@ -1415,15 +1784,18 @@ function stopMailboxSync(accountId: string): void {
 }
 
 /**
- * Start a 15-minute background sync timer — matches the Proton project's
- * PROTON_BACKGROUND_SYNC_INTERVAL_MS. Performs a more thorough refresh
- * in the background to keep data fresh.
+ * Start a 15-minute background sync timer — performs a more thorough refresh
+ * to keep data fresh.
  */
 function startBackgroundSync(accountId: string, view: BrowserView): void {
   stopBackgroundSync(accountId)
 
   const timer = setInterval(() => {
     try {
+      if (!view.webContents || view.webContents.isDestroyed()) {
+        stopBackgroundSync(accountId)
+        return
+      }
       view.webContents.executeJavaScript(`
         (function() {
           // Full background sync: collect rows, sync, and also reload
@@ -1433,7 +1805,8 @@ function startBackgroundSync(accountId: string, view: BrowserView): void {
           }
         })();
       `).catch(() => {
-        stopBackgroundSync(accountId)
+        // Transient failures must not kill the background sync — retry next tick.
+        logger.debug('Background sync tick failed — will retry next tick', { accountId })
       })
     } catch {
       stopBackgroundSync(accountId)
@@ -1457,6 +1830,7 @@ function stopBackgroundSync(accountId: string): void {
  */
 async function triggerMailboxRefresh(view: BrowserView): Promise<boolean> {
   try {
+    if (!view.webContents || view.webContents.isDestroyed()) return false
     const result = await view.webContents.executeJavaScript(`
       (function() {
         if (typeof window.__mailbridgeMailboxSyncNow === 'function') {
@@ -1472,242 +1846,310 @@ async function triggerMailboxRefresh(view: BrowserView): Promise<boolean> {
   }
 }
 
-export function registerProtonHandlers(): void {
-  ipcMain.handle(IpcChannels.PROTON_CREATE_SESSION, async (_event, accountId: string) => {
-    // If session already exists, just show it (don't create twice)
-    const existing = sessions.get(accountId)
-    if (existing) {
-      const mainWindow = BrowserWindow.getFocusedWindow()
-      if (mainWindow) {
-        mainWindow.setBrowserView(existing.view)
-        existing.view.setBounds({ x: 0, y: 0, width: 800, height: 600 })
-      }
-      startKeepAlive(accountId, existing.view)
-      return { accountId, sessionPath: existing.partition, restored: true }
+/**
+ * Build (or return existing) BrowserView for a Proton account.
+ *
+ * - Each account is a separate BrowserView attached to the main MailBridge
+ *   window — visually embedded inside the app, like the original UX.
+ * - Each view has its own session partition: `persist:proton-${accountId}`
+ *   with a realistic Chrome 138 User-Agent + Client Hints attached via
+ *   `applyChromeFingerprint`, so Proton sees multiple legitimate browser
+ *   sessions instead of one fingerprint with many accounts.
+ * - If `showNow` is true, the view is attached immediately; otherwise it
+ *   is created detached and stays unloaded-and-idle in the background.
+ *   Background init keeps the partition alive and Proton's session running,
+ *   so when the user clicks an account the inbox is already loaded.
+ */
+/**
+ * Shared refresh logic: prefer a gentle mailbox sync (via the injected
+ * observer), falling back to a full page reload.
+ */
+async function refreshSession(accountId: string, view: BrowserView): Promise<void> {
+  try {
+    const synced = await triggerMailboxRefresh(view)
+    if (!synced) {
+      view.webContents.reload()
     }
+  } catch {
+    try { view.webContents.reload() } catch { /* ignore */ }
+  }
+}
 
-    const mainWindow = BrowserWindow.getFocusedWindow()
-    if (!mainWindow) throw new Error('No main window')
+/**
+ * Intercept F5 / Ctrl+R inside a Proton BrowserView and refresh the mailbox
+ * instead of letting Chromium ignore (or reload) the key.
+ */
+function setupRefreshKeyHandler(accountId: string, view: BrowserView): void {
+  view.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return
+    const isRefreshKey =
+      input.key === 'F5' ||
+      (input.key.toLowerCase() === 'r' && (input.control || input.meta))
+    if (!isRefreshKey) return
+    event.preventDefault()
+    refreshSession(accountId, view)
+  })
+}
 
-    const partition = `persist:proton-${accountId}`
-    const view = new BrowserView({
-      webPreferences: {
-        partition,
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true
-      }
-    })
-
-    mainWindow.setBrowserView(view)
-    view.setBounds({ x: 0, y: 0, width: 800, height: 600 })
-    view.webContents.loadURL(PROTON_MAIL_URL)
-
-    view.webContents.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    )
-
-    view.webContents.on('did-finish-load', () => {
-      const url = view.webContents.getURL()
-      const isLoggedIn = url.includes('/inbox') || url.includes('/mail') || url.includes('/conversations')
-      if (isLoggedIn) {
-        _event.sender.send(IpcChannels.PROTON_NOTIFY_LOGIN, { accountId })
-      }
-      // Always inject scripts — the observer will work once the DOM is ready
-      injectNotificationInterceptor(view)
-      injectMailboxObserver(view)
-    })
-
-    // Re-inject scripts when SPA navigates to the inbox after login
-    view.webContents.on('did-navigate-in-page', (_navEvent, url) => {
-      const isLoggedIn = url.includes('/inbox') || url.includes('/mail') || url.includes('/conversations')
-      if (isLoggedIn) {
-        // Notify the renderer that the user has logged in
-        _event.sender.send(IpcChannels.PROTON_NOTIFY_LOGIN, { accountId })
-        injectNotificationInterceptor(view)
-        injectMailboxObserver(view)
-      }
-    })
-
-    // Monitor page title changes to detect new email notifications
-    // Proton Mail updates the title with unread count: "(3) Inbox"
-    view.webContents.on('page-title-updated', (_e, title) => {
-      // Only process if logged in (url contains inbox/mail)
-      const url = view.webContents.getURL()
-      const isLoggedIn = url.includes('/inbox') || url.includes('/mail') || url.includes('/conversations')
-      if (!isLoggedIn) {
-        lastUnreadCounts.set(accountId, 0)
+/**
+ * Refresh the Proton session whose BrowserView is currently attached to the
+ * main window. Used when F5 / Ctrl+R is pressed while focus is on the app
+ * shell (sidebar, title bar, etc.) so the mail refreshes instead of the app UI.
+ */
+export function refreshAttachedSession(): void {
+  try {
+    const mainWindow = findMainWindow()
+    const view = mainWindow?.getBrowserView?.()
+    if (!view) return
+    for (const [accountId, entry] of sessions) {
+      if (entry.view === view) {
+        refreshSession(accountId, view)
         return
       }
+    }
+  } catch { /* ignore */ }
+}
 
-      const currentCount = parseUnreadCount(title)
-      const prevCount = lastUnreadCounts.get(accountId) ?? -1
+function ensureProtonView(
+  accountId: string,
+  showNow: boolean,
+  bounds?: { x: number; y: number; width: number; height: number }
+): ProtonSession {
+  const existing = sessions.get(accountId)
+  if (existing) {
+    const viewLive = existing.view.webContents && !existing.view.webContents.isDestroyed()
+    if (!viewLive) {
+      // Drop the stale entry — its webContents is gone. Clean up timers
+      // too so they don't fire against a dead acccount.
+      sessions.delete(accountId)
+      stopKeepAlive(accountId)
+      stopMailboxSync(accountId)
+      stopBackgroundSync(accountId)
+      lastUnreadCounts.delete(accountId)
+    } else {
+      if (showNow) attachProtonView(existing, bounds)
+      else if (bounds) try { existing.view.setBounds(bounds) } catch { /* ignored */ }
+      return existing
+    }
+  }
 
-      // Only fire notification if we have a previous count and it increased
-      if (prevCount >= 0 && currentCount > prevCount) {
-        const increasedBy = currentCount - prevCount
+  const partition = `persist:proton-${accountId}`
 
-        // Cooldown check: prevent duplicate notifications from rapid title oscillations
-        // (e.g., "(1) Inbox" → "(0) Inbox" → "(1) Inbox" within milliseconds)
-        const cooldownKey = `${accountId}:${currentCount}`
-        const lastTime = lastNotifTimestamps.get(cooldownKey) || 0
-        if (Date.now() - lastTime < NOTIF_COOLDOWN_MS) {
-          // Skip duplicate within cooldown window, but still update the count
-          lastUnreadCounts.set(accountId, currentCount)
-          return
-        }
-        lastNotifTimestamps.set(cooldownKey, Date.now())
+  // Configure the per-account session BEFORE creating the BrowserView so the
+  // very first request that Proton receives already carries our UA + Client Hints.
+  const ses = session.fromPartition(partition, { cache: true })
+  applyChromeFingerprint(ses)
 
-        logger.info('New Proton email detected', {
-          accountId,
-          prevCount,
-          currentCount,
-          increase: increasedBy
-        })
-
-        notifyForProtonMail(view, accountId, currentCount, increasedBy)
-      }
-
-      lastUnreadCounts.set(accountId, currentCount)
-    })
-
-    view.webContents.on('did-fail-load', (_e, errorCode, errorDescription) => {
-      logger.warn('Proton BrowserView load failed', { accountId, errorCode, errorDescription })
-    })
-
-    // Monitor for crashes or unresponsive state
-    view.webContents.on('crashed', () => {
-      logger.warn('Proton BrowserView crashed', { accountId })
-    })
-
-    setupExternalLinkHandler(view)
-
-    sessions.set(accountId, { view, partition })
-    startKeepAlive(accountId, view)
-    startMailboxSync(accountId, view)
-    startBackgroundSync(accountId, view)
-    logger.info('Proton session created', { accountId })
-
-    return { accountId, sessionPath: partition, restored: false }
+  const view = new BrowserView({
+    webPreferences: {
+      partition,
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      backgroundThrottling: true,
+      spellcheck: false
+    }
   })
 
-  // Background init: creates a Proton session without attaching to any window.
-  // This pre-loads Proton Mail so it's ready when the user clicks on the account.
+  // Belt-and-suspenders: also override UA at the webContents level so the
+  // very first navigation's User-Agent header is already right.
+  view.webContents.setUserAgent(PROTON_USER_AGENT)
+
+  const session_: ProtonSession = { view, partition }
+  sessions.set(accountId, session_)
+
+  setupExternalLinkHandler(view)
+  startKeepAlive(accountId, view)
+  startMailboxSync(accountId, view)
+  startBackgroundSync(accountId, view)
+
+  // Wire up listeners BEFORE loadURL so we never miss a `did-finish-load`
+  // for the very first navigation.
+  attachProtonListeners(view, accountId)
+
+  view.webContents.loadURL(PROTON_MAIL_URL)
+
+  if (showNow) {
+    attachProtonView(session_, bounds)
+  }
+
+  logger.info('Proton session created', { accountId, partition })
+  return session_
+}
+
+/**
+ * Attach (or re-attach) a per-account BrowserView to the main window,
+ * positioning it inside the main window's content area. Idempotent — calling
+ * this on a view that's already attached just updates its bounds and re-asserts
+ * it as the main window's current BrowserView.
+ */
+function attachProtonView(
+  session_: ProtonSession,
+  bounds?: { x: number; y: number; width: number; height: number }
+): void {
+  const mainWindow = findMainWindow()
+  if (!mainWindow) return
+  if (bounds) {
+    try { session_.view.setBounds(bounds) } catch { /* ignored */ }
+  } else if (session_.view.getBounds().width === 0) {
+    // First attach with no explicit bounds — give it a sane default that
+    // matches what the renderer used to compute (sidebar+titlebar offset).
+    try { session_.view.setBounds({ x: 0, y: 0, width: 1024, height: 720 }) } catch { /* ignored */ }
+  }
+  try {
+    mainWindow.setBrowserView(session_.view)
+  } catch {
+    // Window may already be destroyed
+  }
+}
+
+/**
+ * Wire up listeners on the per-account BrowserView for navigation, login
+ * detection, refresh, and notification interception. Called exactly once per
+ * newly-created view in `ensureProtonView`.
+ */
+function attachProtonListeners(view: BrowserView, accountId: string): void {
+  view.webContents.on('did-finish-load', () => {
+    const url = view.webContents.getURL()
+    const isLoggedIn = url.includes('/inbox') || url.includes('/mail') || url.includes('/conversations')
+    if (isLoggedIn) {
+      try { view.webContents.send(IpcChannels.PROTON_NOTIFY_LOGIN, { accountId }) } catch { /* renderer might be down */ }
+    }
+    injectNotificationInterceptor(view)
+    injectMailboxObserver(view)
+  })
+
+  // Re-inject scripts when SPA navigates to the inbox after login
+  view.webContents.on('did-navigate-in-page', (_navEvent, url) => {
+    const isLoggedIn = url.includes('/inbox') || url.includes('/mail') || url.includes('/conversations')
+    if (isLoggedIn) {
+      try { view.webContents.send(IpcChannels.PROTON_NOTIFY_LOGIN, { accountId }) } catch { /* renderer might be down */ }
+      injectNotificationInterceptor(view)
+      injectMailboxObserver(view)
+    }
+  })
+
+  // Monitor page title changes to detect new email notifications.
+  // Proton Mail updates the title with the unread count: "(3) Inbox"
+  view.webContents.on('page-title-updated', (_e, title) => {
+    const url = view.webContents.getURL()
+    const isLoggedIn = url.includes('/inbox') || url.includes('/mail') || url.includes('/conversations')
+    if (!isLoggedIn) {
+      lastUnreadCounts.set(accountId, 0)
+      return
+    }
+
+    const currentCount = parseUnreadCount(title)
+    const prevCount = lastUnreadCounts.get(accountId) ?? -1
+
+    if (prevCount >= 0 && currentCount > prevCount) {
+      const increasedBy = currentCount - prevCount
+      const cooldownKey = `${accountId}:${currentCount}`
+      const lastTime = lastNotifTimestamps.get(cooldownKey) || 0
+      if (Date.now() - lastTime < NOTIF_COOLDOWN_MS) {
+        // Skip duplicate within cooldown window but keep the counter in sync.
+        lastUnreadCounts.set(accountId, currentCount)
+        return
+      }
+      lastNotifTimestamps.set(cooldownKey, Date.now())
+
+      logger.info('New Proton email detected', {
+        accountId,
+        prevCount,
+        currentCount,
+        increase: increasedBy
+      })
+
+      notifyForProtonMail(view, accountId, currentCount, increasedBy)
+    }
+
+    lastUnreadCounts.set(accountId, currentCount)
+  })
+
+  view.webContents.on('did-fail-load', (_e, errorCode, errorDescription) => {
+    logger.warn('Proton view load failed', { accountId, errorCode, errorDescription })
+  })
+
+  view.webContents.on('crashed', () => {
+    logger.warn('Proton view crashed', { accountId })
+  })
+
+  // F5 / Ctrl+R refreshes this account's mailbox
+  setupRefreshKeyHandler(accountId, view)
+}
+
+export function registerProtonHandlers(): void {
+  ipcMain.handle(IpcChannels.PROTON_CREATE_SESSION, async (_event, accountId: string, bounds?: { x: number; y: number; width: number; height: number }) => {
+    const wasExisting = sessions.has(accountId)
+    const session_ = ensureProtonView(accountId, /* showNow */ true, bounds)
+    return {
+      accountId,
+      sessionPath: session_.partition,
+      restored: wasExisting
+    }
+  })
+
+  // Background init: v2.28.0 change — pre-creating every account's Proton
+  // BrowserView at startup was the dominant source of idle RAM (each view
+  // routinely consumed 200-400MB of resident memory even before the user
+  // clicked on it). Under the user's 500MB hard cap we no longer create
+  // BrowserViews eagerly. Proton sessions are now created lazily, only
+  // when the user actually clicks an account ("PROTON_SHOW_SESSION" below),
+  // with one-active-session-at-a-time eviction.
+  //
+  // Trade-off: a 1-3s loading delay when switching between accounts while
+  // the inactive BrowserView is destroyed and re-created on demand.
+  // Notifications for the *currently active* account are unaffected.
   ipcMain.handle(IpcChannels.PROTON_INIT_SESSION, async (_event, accountId: string) => {
-    // If session already exists, nothing to do
+    // Load every Proton account in the background at startup so accounts come
+    // up logged-in and active without the user having to open each one. The
+    // view is created detached — it loads Proton Mail and the per-session
+    // keep-alive / mailbox-sync timers keep it active. The MemoryWatchdog and
+    // single-active-session eviction remain the RAM safety net.
     const existing = sessions.get(accountId)
     if (existing) {
       return { accountId, sessionPath: existing.partition, restored: true }
     }
-
-    const partition = `persist:proton-${accountId}`
-    const view = new BrowserView({
-      webPreferences: {
-        partition,
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true
-      }
-    })
-
-    view.webContents.loadURL(PROTON_MAIL_URL)
-    view.webContents.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    )
-
-    view.webContents.on('did-finish-load', () => {
-      // Always inject scripts — the observer will work once the DOM is ready
-      injectNotificationInterceptor(view)
-      injectMailboxObserver(view)
-    })
-
-    // Re-inject scripts when SPA navigates to the inbox after login
-    view.webContents.on('did-navigate-in-page', (_navEvent, url) => {
-      const isLoggedIn = url.includes('/inbox') || url.includes('/mail') || url.includes('/conversations')
-      if (isLoggedIn) {
-        injectNotificationInterceptor(view)
-        injectMailboxObserver(view)
-      }
-    })
-
-    // Monitor page title for new email notifications
-    view.webContents.on('page-title-updated', (_e, title) => {
-      const url = view.webContents.getURL()
-      const isLoggedIn = url.includes('/inbox') || url.includes('/mail') || url.includes('/conversations')
-      if (!isLoggedIn) {
-        lastUnreadCounts.set(accountId, 0)
-        return
-      }
-
-      const currentCount = parseUnreadCount(title)
-      const prevCount = lastUnreadCounts.get(accountId) ?? -1
-
-      if (prevCount >= 0 && currentCount > prevCount) {
-        const increasedBy = currentCount - prevCount
-
-        const cooldownKey = `${accountId}:${currentCount}`
-        const lastTime = lastNotifTimestamps.get(cooldownKey) || 0
-        if (Date.now() - lastTime < NOTIF_COOLDOWN_MS) {
-          lastUnreadCounts.set(accountId, currentCount)
-          return
-        }
-        lastNotifTimestamps.set(cooldownKey, Date.now())
-
-        logger.info('New Proton email detected (background)', {
-          accountId, prevCount, currentCount, increase: increasedBy
-        })
-
-        notifyForProtonMail(view, accountId, currentCount, increasedBy)
-      }
-
-      lastUnreadCounts.set(accountId, currentCount)
-    })
-
-    view.webContents.on('did-fail-load', (_e, errorCode, errorDescription) => {
-      logger.warn('Proton background init load failed', { accountId, errorCode, errorDescription })
-    })
-
-    view.webContents.on('crashed', () => {
-      logger.warn('Proton background init crashed', { accountId })
-    })
-
-    setupExternalLinkHandler(view)
-
-    sessions.set(accountId, { view, partition })
-    startKeepAlive(accountId, view)
-    startMailboxSync(accountId, view)
-    startBackgroundSync(accountId, view)
-    logger.info('Proton session initialized in background', { accountId })
-
-    return { accountId, sessionPath: partition, restored: false }
+    const session_ = ensureProtonView(accountId, /* showNow */ false)
+    return { accountId, sessionPath: session_.partition, restored: false }
   })
 
   ipcMain.handle(IpcChannels.PROTON_SHOW_SESSION, async (_event, accountId: string, bounds?: { x: number; y: number; width: number; height: number }) => {
+    // v2.28.0: enforce a single active BrowserView at a time. Free the
+    // RAM occupied by every other Proton session before bringing up the
+    // requested one. This is the main lever that lets us stay under the
+    // 500MB cap when the user has multiple Proton accounts configured.
+    //
+    // We snapshot the keys first because `destroyProtonSession()` mutates
+    // `sessions` in place.
+    const otherIds = Array.from(sessions.keys()).filter(id => id !== accountId)
+    for (const id of otherIds) {
+      try { destroyProtonSession(id) } catch (err) {
+        logger.warn('Failed to free idle Proton session during switch', { id, error: String(err) })
+      }
+    }
+
     const existing = sessions.get(accountId)
     if (!existing) {
-      throw new Error('Proton session not found')
+      // Lazy-create on show — handler called before init/complete
+      ensureProtonView(accountId, /* showNow */ true, bounds)
+      return
     }
     try {
-      const mainWindow = BrowserWindow.getFocusedWindow()
-      if (mainWindow) {
-        mainWindow.setBrowserView(existing.view)
-        if (bounds) {
-          existing.view.setBounds(bounds)
-        }
-        // Re-start keep-alive and mailbox sync for this session
-        startKeepAlive(accountId, existing.view)
-        startMailboxSync(accountId, existing.view)
-        startBackgroundSync(accountId, existing.view)
-      }
+      attachProtonView(existing, bounds)
+      // Re-start keep-alive and mailbox sync for this view
+      startKeepAlive(accountId, existing.view)
+      startMailboxSync(accountId, existing.view)
+      startBackgroundSync(accountId, existing.view)
     } catch {
       throw new Error('Failed to show Proton session')
     }
   })
 
   ipcMain.handle(IpcChannels.PROTON_KEEP_ALIVE, async (_event, accountId: string) => {
-    const existing = sessions.get(accountId)
-    if (existing) {
-      startKeepAlive(accountId, existing.view)
+    const session_ = sessions.get(accountId)
+    if (session_) {
+      startKeepAlive(accountId, session_.view)
       return true
     }
     return false
@@ -1740,37 +2182,24 @@ export function registerProtonHandlers(): void {
   })
 
   ipcMain.handle(IpcChannels.PROTON_DESTROY_SESSION, async (_event, accountId: string) => {
-    const session_ = sessions.get(accountId)
-    if (session_) {
-      stopKeepAlive(accountId)
-      stopMailboxSync(accountId)
-      stopBackgroundSync(accountId)
-      try {
-        const win = BrowserWindow.getFocusedWindow()
-        if (win) {
-          win.removeBrowserView(session_.view)
-        }
-        ;(session_.view as any).destroy()
-      } catch {
-        // View might already be destroyed
-      }
-      sessions.delete(accountId)
-    }
+    destroyProtonSession(accountId)
   })
 
   ipcMain.handle(IpcChannels.PROTON_HIDE_SESSION, async (_event, accountId: string) => {
     const session_ = sessions.get(accountId)
-    if (session_) {
-      try {
-        const win = BrowserWindow.getFocusedWindow()
-        if (win) {
-          win.removeBrowserView(session_.view)
+    if (!session_) return
+    try {
+      const mainWindow = findMainWindow()
+      if (mainWindow) {
+        const current = mainWindow.getBrowserView()
+        if (current === session_.view) {
+          mainWindow.setBrowserView(null)
         }
-      } catch {
-        // View might be destroyed
       }
-      // Keep the session alive — just detach from window
-      // Keep-alive and mailbox sync timers continue to prevent Proton timeout
+      // Sessions stay alive — keep-alive + mailbox timers continue so the
+      // user doesn't lose Proton mail login state.
+    } catch {
+      // View might be destroyed
     }
   })
 
@@ -1798,35 +2227,102 @@ export function registerProtonHandlers(): void {
   })
 }
 
-export function destroyAllProtonSessions(): void {
-  for (const [accountId] of sessions) {
-    stopKeepAlive(accountId)
-    stopMailboxSync(accountId)
-    stopBackgroundSync(accountId)
-    const session_ = sessions.get(accountId)
-    if (session_) {
-      try {
-        // Destroy the webContents first — this properly tears down the renderer
-        // without triggering crash events. Works reliably even when the parent
-        // window is already being destroyed during app quit.
-        if (!session_.view.webContents.isDestroyed()) {
-          session_.view.webContents.destroy()
-        }
-      } catch {
-        // webContents might already be destroyed
-      }
-      try {
-        ;(session_.view as any).destroy()
-      } catch {
-        // View might already be destroyed
+// Register foreground↔background throttling lifecycle listeners as soon as this
+// module is loaded. They become active immediately and start gating timer/
+// observer activity the moment the first Proton BrowserView is attached. The
+// registerProtonHandlers() and ensureProtonView() entry points above already
+// mutate `sessions`, so by the time the visibility event fires those calls
+// will behave as intended.
+registerVisibilityHandlers()
+
+/**
+ * Tear down one Proton session: kill timers, detach from main window,
+ * destroy the BrowserView entirely, wipe notification dedup state.
+ */
+function destroyProtonSession(accountId: string): void {
+  const session_ = sessions.get(accountId)
+  if (!session_) return
+  stopKeepAlive(accountId)
+  stopMailboxSync(accountId)
+  stopBackgroundSync(accountId)
+  try {
+    const mainWindow = findMainWindow()
+    if (mainWindow) {
+      const current = mainWindow.getBrowserView()
+      if (current === session_.view) {
+        mainWindow.setBrowserView(null)
       }
     }
+  } catch {
+    // mainWindow might already be gone
   }
+  try {
+    // BrowserView's `destroy()` is exposed at runtime but isn't in every
+    // typings rev. Cast through `unknown` (rather than `any`) so we don't
+    // widen to any — view.destroy() tears down its webContents for us.
+    ;(session_.view as unknown as { destroy?: () => void }).destroy?.()
+  } catch {
+    // Already torn down
+  }
+  sessions.delete(accountId)
+  lastUnreadCounts.delete(accountId)
+  wasLoggedInSessions.delete(accountId)
+  // Don't drop lastNotifTimestamps entries — those keys are scoped by
+  // (accountId,count) so leaving them is harmless and avoids re-firing
+  // dedup gaps on quick destroy/recreate.
+}
+
+export function destroyAllProtonSessions(): void {
+  // When "Clear session on exit" is enabled, wipe the persisted Proton login
+  // data (cookies etc.) for every account — this forces a fresh login on the
+  // next start even for accounts without a live session.
+  try {
+    if (storageService.getSettings().clearSessionOnExit === true) {
+      for (const account of storageService.getAccounts()) {
+        if (account.provider !== 'proton') continue
+        try {
+          session.fromPartition(`persist:proton-${account.id}`).clearStorageData()
+        } catch { /* partition may not exist */ }
+      }
+    }
+  } catch { /* settings/accounts may be unavailable during shutdown */ }
+  for (const accountId of Array.from(sessions.keys())) {
+    destroyProtonSession(accountId)
+  }
+  // Defensive sweep in case any map-level state lingered
   sessions.clear()
-  // Clear all session-related state maps for a clean restart
   keepAliveTimers.clear()
   mailboxSyncTimers.clear()
   backgroundSyncTimers.clear()
   lastUnreadCounts.clear()
   lastNotifTimestamps.clear()
+}
+
+/**
+ * v2.28.0 helper for the main-process MemoryWatchdog.
+ *
+ * Destroys a single Proton session whose BrowserView is currently *not*
+ * the attached foreground view of the main window — i.e. a session the
+ * user is not actively looking at. Returns `true` if a session was evicted,
+ * `false` if every active session is in use (no RAM to reclaim).
+ *
+ * The watchdog calls this in a tight loop until either the total Electron
+ * RSS is back under target or no more idle sessions remain.
+ */
+export function evictIdleProtonSession(): boolean {
+  const mainWindow = findMainWindow()
+  const attachedView = (() => {
+    try { return mainWindow?.getBrowserView?.() ?? null } catch { return null }
+  })()
+
+  // Pick the first session whose view is not the currently-attached one.
+  // Map preserves insertion order — so the oldest idle session is evicted
+  // first, which is the right trade-off for "least-recently-touched".
+  for (const [accountId, session_] of Array.from(sessions.entries())) {
+    if (attachedView && session_.view === attachedView) continue
+    destroyProtonSession(accountId)
+    logger.info('MemoryWatchdog evicted idle Proton session', { accountId })
+    return true
+  }
+  return false
 }

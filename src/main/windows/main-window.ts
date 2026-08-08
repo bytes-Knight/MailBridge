@@ -1,8 +1,10 @@
-import { BrowserWindow, shell } from 'electron'
+import { app, BrowserWindow, shell } from 'electron'
 import { join } from 'path'
 import { logger } from '../services/logger'
 import { windowStateManager } from '../services/window-state'
-import { getWindowIcon } from '../services/icon-loader'
+import { storageService } from '../services/storage'
+import { getWindowIcon, getIconPath } from '../services/icon-loader'
+import { refreshAttachedSession } from '../ipc/proton-handler'
 
 let crashCount = 0
 const MAX_CRASH_RELOADS = 10
@@ -17,9 +19,14 @@ export function setQuitting(value: boolean): void {
 export function createMainWindow(): BrowserWindow {
   const savedState = windowStateManager.get()
 
+  // On Windows, passing a direct .ico file PATH string works better for the
+  // taskbar icon than a NativeImage. The NativeImage fallback via setIcon()
+  // is added below for extra reliability.
+  const iconPath = getIconPath()
+
   const mainWindow = new BrowserWindow({
     ...windowStateManager.getWindowOptions(),
-    icon: getWindowIcon(),
+    icon: iconPath || getWindowIcon(),
     frame: false,
     titleBarStyle: 'hidden',
     show: false,
@@ -34,6 +41,28 @@ export function createMainWindow(): BrowserWindow {
     }
   })
 
+  // Mark this window as the main MailBridge window so the Proton handler
+  // can locate it reliably (even when other BrowserWindows — one per Proton
+  // account — are focused). Each account's Proton window is created with
+  // `parent: mainWindow`, keeping it visually embedded but giving it its own
+  // webContents, partition and process isolation.
+  ;(mainWindow as any).__isMainWindow = true
+
+  // F5 / Ctrl+R while focus is on the app shell should refresh the active
+  // Proton session, not reload the app UI.
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return
+    const isRefreshKey =
+      input.key === 'F5' ||
+      (input.key.toLowerCase() === 'r' && (input.control || input.meta))
+    if (!isRefreshKey) return
+    // Only take over the key when a Proton view is attached to this window;
+    // otherwise keep the default behavior (e.g. dev reload of the app shell).
+    if (!mainWindow.getBrowserView()) return
+    event.preventDefault()
+    refreshAttachedSession()
+  })
+
   // Restore maximized state if it was saved
   if (savedState.isMaximized) {
     mainWindow.maximize()
@@ -42,10 +71,48 @@ export function createMainWindow(): BrowserWindow {
   // Intercept close to minimize to tray (hide) instead of destroy
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
-      event.preventDefault()
-      mainWindow.hide()
-      logger.info('Window hidden to tray')
+      // Honor the "Minimize to tray" setting: when disabled, closing the
+      // window quits the app instead of hiding to the tray.
+      let minimizeToTray = true
+      try {
+        minimizeToTray = storageService.getSettings().minimizeToTray !== false
+      } catch {
+        // Default to tray behavior if settings can't be read
+      }
+      if (minimizeToTray) {
+        event.preventDefault()
+        mainWindow.hide()
+        logger.info('Window hidden to tray')
+        return
+      }
+      logger.info('Minimize to tray disabled — quitting on window close')
+      app.quit()
     }
+  })
+
+  // Broadcast a process-wide "background" event whenever the main window leaves the
+  // foreground so service modules (Proton handlers, sync services) can throttle
+  // background polling (MutationObservers, mailbox syncs, React render loops)
+  // without losing any feature — Proton page-title-updated events still fire for
+  // notifications because the BrowserViews themselves remain alive.
+  mainWindow.on('hide', () => {
+    app.emit('mailbridge:visibility', 'hidden')
+  })
+  mainWindow.on('minimize', () => {
+    app.emit('mailbridge:visibility', 'hidden')
+  })
+  mainWindow.on('blur', () => {
+    // `blur` fires for any focus loss, but we also fire on `restore`/`show`, so
+    // receiving a `shown` event after `blur` is idempotent.
+    if (!mainWindow.isVisible() || mainWindow.isMinimized()) {
+      app.emit('mailbridge:visibility', 'hidden')
+    }
+  })
+  mainWindow.on('show', () => {
+    app.emit('mailbridge:visibility', 'visible')
+  })
+  mainWindow.on('restore', () => {
+    app.emit('mailbridge:visibility', 'visible')
   })
 
   // Track window state changes for persistence
@@ -156,12 +223,25 @@ export function createMainWindow(): BrowserWindow {
   })
 
   mainWindow.on('ready-to-show', () => {
+    // Set icon RIGHT before showing — ensures Windows taskbar picks up the icon
+    // on the first paint. This is critical for the taskbar icon to be correct
+    // from the moment the window appears.
+    try { mainWindow.setIcon(getWindowIcon()) } catch { /* non-critical */ }
     mainWindow.show()
   })
 
   // Log loading failures
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
     logger.warn('Main window load failed', { errorCode, errorDescription })
+  })
+
+  // Set icon immediately after creation (belt-and-suspenders with constructor option)
+  try { mainWindow.setIcon(getWindowIcon()) } catch { /* non-critical */ }
+
+  // Set icon again after the window is shown — some Windows configurations
+  // need a post-show setIcon call for the taskbar to update properly
+  mainWindow.on('show', () => {
+    try { mainWindow.setIcon(getWindowIcon()) } catch { /* non-critical */ }
   })
 
   // Load content

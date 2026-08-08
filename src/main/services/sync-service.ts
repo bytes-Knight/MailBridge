@@ -18,10 +18,32 @@ class SyncService {
   }
 
   start(): void {
-    this.syncAll()
-    const interval = storageService.getSettings().syncInterval || 20
+    const settings = storageService.getSettings()
+    if (settings.syncOnStartup !== false) {
+      this.syncAll()
+    }
+    this.applySyncInterval()
+    logger.info('Sync service started', {
+      autoSync: settings.autoSync !== false,
+      syncOnStartup: settings.syncOnStartup !== false,
+      syncInterval: settings.syncInterval || 20
+    })
+  }
+
+  /**
+   * (Re)apply the configured sync cadence from current settings. Reads the
+   * settings live so changes made in Settings take effect immediately, and
+   * respects the "Auto-sync" toggle (no interval when disabled).
+   */
+  applySyncInterval(): void {
+    if (this.intervalId) {
+      clearInterval(this.intervalId)
+      this.intervalId = null
+    }
+    const settings = storageService.getSettings()
+    if (settings.autoSync === false) return
+    const interval = settings.syncInterval || 20
     this.intervalId = setInterval(() => this.syncAll(), Math.max(interval, 20) * 1000)
-    logger.info('Sync service started')
   }
 
   stop(): void {

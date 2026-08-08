@@ -12,8 +12,8 @@ export function ProtonView({ accountId }: ProtonViewProps): React.ReactElement {
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('idle')
   const [lastSyncTime, setLastSyncTime] = useState<number | null>(null)
-  const keepAliveRef = useRef<ReturnType<typeof setInterval>>()
-  const syncCheckRef = useRef<ReturnType<typeof setInterval>>()
+  const keepAliveRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const syncCheckRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // Poll the injected observer's sync status from the Proton webview
   const pollSyncStatus = useCallback(async () => {
@@ -67,24 +67,51 @@ export function ProtonView({ accountId }: ProtonViewProps): React.ReactElement {
 
     const mb = (window as any).mailbridge
 
-    // Start periodic keep-alive pings (every 2 minutes) to prevent proton timeout
+    // Start periodic keep-alive pings (every 2 minutes) to prevent proton timeout.
+    // We *do* keep this alive even when the window is hidden because Proton's
+    // login state requires periodic browser activity.
     keepAliveRef.current = setInterval(() => {
+      // Skip while the whole app is backgrounded — the main process runs its own
+      // per-account keep-alive (startKeepAlive in proton-handler.ts) at 4min, so
+      // we don't need to also ping here while the user can't see the result.
+      if (typeof document !== 'undefined' && document.hidden) return
       mb?.protonKeepAlive?.(accountId)
     }, 2 * 60 * 1000)
 
-    // Poll sync status every 15 seconds (matching the mailbox observer periodic sync)
+    // Poll sync status every 15 seconds (matching the mailbox observer periodic sync).
+    // Pauses automatically while the window is hidden — the IPC round-trip per
+    // tick is cheap but pointless and a few hundred K can be reclaimed over time.
     syncCheckRef.current = setInterval(pollSyncStatus, 15 * 1000)
 
     const removeLoginListener = mb?.onProtonStatus?.((data: any) => {
       if (data.status === 'logged-in') setSessionState('active')
     })
 
+    // If the main window is hidden while this view is mounted, immediately pause
+    // the React-side polling timers. mailbridge:visibility is emitted from
+    // main-window.ts; the renderer subscribes via document visibilitychange which
+    // is the browser-native equivalent.
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        if (syncCheckRef.current) {
+          clearInterval(syncCheckRef.current)
+          syncCheckRef.current = null
+        }
+      } else if (!syncCheckRef.current) {
+        syncCheckRef.current = setInterval(pollSyncStatus, 15 * 1000)
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
     return () => {
       // Hide instead of destroy — keeps the session alive in the background
       mb?.protonHideSession?.(accountId)
       if (keepAliveRef.current) clearInterval(keepAliveRef.current)
       if (syncCheckRef.current) clearInterval(syncCheckRef.current)
+      keepAliveRef.current = null
+      syncCheckRef.current = null
       removeLoginListener?.()
+      document.removeEventListener('visibilitychange', onVisibilityChange)
     }
   }, [accountId, initSession, pollSyncStatus])
 

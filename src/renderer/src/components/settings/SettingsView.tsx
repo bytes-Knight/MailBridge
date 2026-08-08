@@ -14,7 +14,7 @@ const SETTINGS_SECTIONS = [
 ] as const
 
 export function SettingsView(): React.ReactElement {
-  const { accounts, removeAccount } = useAccount()
+  const { accounts, removeAccount, setDefaultAccount } = useAccount()
   const { setTheme, setAccentColor } = useTheme()
   const [activeSection, setActiveSection] = useState<string>('general')
   const [settings, setSettings] = useState<AppSettings | null>(null)
@@ -119,7 +119,7 @@ export function SettingsView(): React.ReactElement {
               <SettingToggle label="Launch on startup" value={settings.launchOnStartup} onChange={(v) => updateSetting('launchOnStartup', v)} />
               <SettingToggle label="Minimize to tray" value={settings.minimizeToTray} onChange={(v) => updateSetting('minimizeToTray', v)} />
               <SettingToggle label="Open to dashboard" value={settings.openToDashboard} onChange={(v) => updateSetting('openToDashboard', v)} />
-              <SettingSelect label="Default account" value={settings.defaultAccount || ''} options={accounts.map(a => ({ value: a.id, label: a.email }))} onChange={(v) => updateSetting('defaultAccount', v || null)} />
+              <SettingSelect label="Default account" value={settings.defaultAccount || ''} options={accounts.map(a => ({ value: a.id, label: a.email }))} onChange={(v) => { updateSetting('defaultAccount', v || null); if (v) setDefaultAccount(v) }} />
             </div>
           </div>
         )

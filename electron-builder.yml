@@ -15,11 +15,10 @@ win:
       arch:
         - x64
   artifactName: ${name}-${version}-setup.${ext}
-  icon: icon.ico
-  # Windows-specific executable options for crash resilience
+  icon: resources/icon.ico
+  # Allow rcedit to embed icon and version info into the exe
   executableName: MailBridge
-  # Enable app sandbox for Windows (limited protection, but helps with isolation)
-  signAndEditExecutable: false
+  signAndEditExecutable: true
   legalTrademarks: MailBridge
   requestedExecutionLevel: asInvoker
 nsis:

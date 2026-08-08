@@ -5,6 +5,31 @@ export const APP_VERSION = '1.0.0'
 export const PROTON_MAIL_URL = 'https://mail.proton.me'
 export const PROTON_ACCOUNT_URL = 'https://account.proton.me'
 
+/**
+ * Realistic Chrome user-agent used for Proton Mail sessions.
+ *
+ * We use Chrome 138 (stable since May 2025) instead of the version Electron
+ * injects by default because:
+ *  - Proton's bot detection flags very new / unknown Chromium versions.
+ *  - Chrome 138 is older than what Electron reports (150.x) and is widely
+ *    deployed, so it looks like a normal Windows desktop browser.
+ *  - Keeping `Win64; x64` and the Windows NT 10.0 platform string matches the
+ *    real fingerprint that Proton sees from legitimate users.
+ *
+ * We also override the User-Agent on the underlying Electron Session
+ * (`session.fromPartition(...).setUserAgent(...)`) AND attach matching
+ * `Sec-CH-UA*` Client Hints headers via `webRequest.onBeforeSendHeaders`,
+ * because Proton also reads these to verify browser identity.
+ */
+export const PROTON_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+
+/** Client Hints — matches the Chrome version advertised in PROTON_USER_AGENT. */
+export const PROTON_SEC_CH_UA =
+  '"Not_A Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"'
+export const PROTON_SEC_CH_UA_PLATFORM = '"Windows"'
+export const PROTON_SEC_CH_UA_MOBILE = '?0'
+
 // Account colors
 export const ACCOUNT_COLORS = [
   '#6366f1', // indigo

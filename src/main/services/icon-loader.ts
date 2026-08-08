@@ -22,40 +22,48 @@ let _cachedAssets: IconAssets | null = null
 /**
  * Resolve the path to the best available application icon.
  *
- * Search order (cached after first call):
- *  1. resources/icon.ico  (alongside app resources in packaged build)
- *  2. resources/icon.png  (fallback to PNG)
- *  3. __dirname relative paths for dev mode
- *  4. process.cwd() relative paths
+ * KEY RUNTIME CONTEXT:
+ * - In dev mode (electron-vite): the main process is bundled FLAT into
+ *   out/main/index.js, so __dirname = <project>/out/main/
+ * - In packaged mode: the main process is in an ASAR at app.asar/dist/main/
+ *
+ * Search order (first match wins):
+ *  1. app.getAppPath() — project root in dev mode, ASAR root in packaged
+ *  2. __dirname relative (2 levels up reaches project root from out/main/)
+ *  3. process.resourcesPath (packaged build — extraResources)
+ *  4. process.cwd() relative
  *  5. Fallback: generate a 32×32 coloured square with "M" letter
  */
 function resolveIconPaths(): IconAssets {
-  const platform = process.platform
-
   // Collect candidate paths in priority order
   const candidates: string[] = []
 
-  // 1) Packaged build — extraResources copies icons alongside the app
-  if (process.resourcesPath) {
-    candidates.push(path.join(process.resourcesPath, 'icon.ico'))
-    candidates.push(path.join(process.resourcesPath, 'icon.png'))
+  // Helper to add paths based on a base directory
+  const addBasePaths = (base: string) => {
+    candidates.push(path.join(base, 'resources', 'icon.ico'))
+    candidates.push(path.join(base, 'resources', 'icon.png'))
+    candidates.push(path.join(base, 'resources', 'icon.svg'))
+    candidates.push(path.join(base, 'icon.ico'))
+    candidates.push(path.join(base, 'icon.png'))
   }
 
-  // 2) App-relative (works in dev from out/main/, and in packaged)
-  candidates.push(path.join(__dirname, '..', '..', 'resources', 'icon.ico'))
-  candidates.push(path.join(__dirname, '..', '..', 'resources', 'icon.png'))
-  candidates.push(path.join(app.getAppPath(), 'resources', 'icon.ico'))
-  candidates.push(path.join(app.getAppPath(), 'resources', 'icon.png'))
+  // 1) app.getAppPath() — MOST RELIABLE in both dev and packaged modes.
+  //    In dev mode with electron-vite, this returns the project root
+  //    (directory containing package.json).
+  addBasePaths(app.getAppPath())
 
-  // 3) Project root (dev mode from project root)
-  candidates.push(path.join(__dirname, '..', '..', 'icon.ico'))
-  candidates.push(path.join(__dirname, '..', '..', 'icon.png'))
+  // 2) __dirname relative paths.
+  //    Compiled output is FLAT: out/main/index.js (not nested like src/)
+  //    __dirname = <project>/out/main/ -> ../../ reaches project root
+  addBasePaths(path.join(__dirname, '..', '..'))
 
-  // 4) Current working directory
-  candidates.push(path.join(process.cwd(), 'icon.ico'))
-  candidates.push(path.join(process.cwd(), 'icon.png'))
-  candidates.push(path.join(process.cwd(), 'resources', 'icon.ico'))
-  candidates.push(path.join(process.cwd(), 'resources', 'icon.png'))
+  // 3) Packaged build — extraResources copies icons alongside the app
+  if (process.resourcesPath) {
+    addBasePaths(process.resourcesPath)
+  }
+
+  // 5) Current working directory (least reliable, but worth checking)
+  addBasePaths(process.cwd())
 
   // Deduplicate while preserving order
   const seen = new Set<string>()
@@ -90,11 +98,25 @@ function resolveIconPaths(): IconAssets {
     // For the tray, we want a 16×16 or 32×32 version.
     // .ico files contain multiple sizes so we can load directly.
     // .png files need explicit resizing.
+    // Load the image — .ico on Windows is handled natively with multi-res.
+    // .png and .svg get resized for the tray.
     if (ext === '.ico') {
       // On Windows, nativeImage handles .ico with multi-res correctly.
-      // Don't resize — let the OS pick the right frame.
       trayImage = nativeImage.createFromPath(chosenPath)
       windowImage = nativeImage.createFromPath(chosenPath)
+    } else if (ext === '.svg') {
+      // SVG — create with explicit size for Electron to rasterize
+      const svgBuffer = fs.readFileSync(chosenPath)
+      try {
+        windowImage = nativeImage.createFromBuffer(svgBuffer, { width: 64, height: 64 })
+        trayImage = windowImage.resize({ width: 16, height: 16 })
+      } catch {
+        // Fallback to the generated icon if SVG fails
+        const fallback = generateFallbackIcon()
+        trayImage = fallback.trayImage
+        windowImage = fallback.windowImage
+        chosenLabel = `${chosenLabel} (svg failed — using fallback)`
+      }
     } else {
       // PNG — resize for tray (16×16) and keep original for window
       trayImage = nativeImage.createFromPath(chosenPath).resize({

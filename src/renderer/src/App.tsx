@@ -14,7 +14,7 @@ import { useNotifications } from './hooks/useNotifications'
 export type ViewMode = 'dashboard' | 'workspace' | 'settings'
 
 export function App(): React.ReactElement {
-  const { accounts, defaultAccount } = useAccount()
+  const { accounts, defaultAccount, loading } = useAccount()
   const [view, setView] = useState<ViewMode>('dashboard')
   const [activeAccountId, setActiveAccountId] = useState<string | null>(null)
   const [showAddModal, setShowAddModal] = useState(false)
@@ -27,30 +27,64 @@ export function App(): React.ReactElement {
   // Initialize notification sound handler (sound playback managed by the hook)
   useNotifications()
 
-  // Auto-start all Proton sessions in the background on startup
-  // so they're ready when the user clicks on an account
+  // Load every Proton account in the background at startup so they come up
+  // logged-in and active without having to open each one manually. The main
+  // process creates the sessions detached and keeps them alive via the
+  // per-session keep-alive + mailbox-sync timers. The MemoryWatchdog /
+  // single-active-session eviction still applies as the RAM safety net.
   useEffect(() => {
     if (accounts.length === 0) return
-
     const protonAccounts = accounts.filter(a => a.provider === 'proton')
     if (protonAccounts.length === 0) return
-
     const mb = (window as any).mailbridge
     if (!mb?.protonInitSession) return
-
-    // Initialize each session sequentially (parallel loads could be heavy)
+    let cancelled = false
     const initAll = async () => {
       for (const account of protonAccounts) {
+        if (cancelled) return
         try {
           await mb.protonInitSession(account.id)
         } catch {
-          // Session init might fail (e.g., not logged in yet) — that's fine
+          // Session init might fail (e.g. not logged in yet) — retried on next refresh
         }
       }
     }
-
     initAll()
+    return () => { cancelled = true }
   }, [accounts])
+
+  // Auto-open the default account's workspace on startup so the user doesn't
+  // have to manually open/activate an account (unless "Open to dashboard" is on).
+  const didAutoOpenRef = useRef(false)
+  useEffect(() => {
+    if (didAutoOpenRef.current) return
+    if (loading || accounts.length === 0) return
+    const run = async () => {
+      let openToDashboard = true
+      let preferredId: string | null = null
+      try {
+        const mb = (window as any).mailbridge
+        const s = await mb?.settingsGet?.()
+        if (s) {
+          openToDashboard = !!s.openToDashboard
+          preferredId = s.defaultAccount || null
+        }
+      } catch {
+        // Default to opening the workspace if settings can't be read
+      }
+      const target =
+        (preferredId && accounts.some(a => a.id === preferredId) ? preferredId : null) ||
+        defaultAccount?.id ||
+        null
+      if (!openToDashboard && target) {
+        setActiveAccountId(target)
+        setView('workspace')
+        setViewKey(k => k + 1)
+      }
+      didAutoOpenRef.current = true
+    }
+    run()
+  }, [accounts, loading, defaultAccount])
 
   // Handle notification navigation
   useEffect(() => {

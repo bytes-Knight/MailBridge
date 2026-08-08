@@ -3,6 +3,7 @@ import { IpcChannels } from '@shared/ipc'
 import type { AccentColor, NotificationAction, NotificationPopupState, NotificationPreview } from '@shared/types'
 import { getWindowIcon } from './icon-loader'
 import { logger } from './logger'
+import { storageService } from './storage'
 import * as fs from 'fs'
 import * as path from 'path'
 
@@ -143,10 +144,13 @@ export class NotificationWindowManager {
       this.mainWindow.show()
       this.mainWindow.focus()
 
+      // Honor the "Click behavior" setting: open the specific message or just
+      // open the account's inbox.
+      const openInbox = storageService.getSettings().clickBehavior === 'open-inbox'
       this.mainWindow.webContents.send(IpcChannels.NOTIFICATION_OPEN_CONVERSATION, {
         accountId: payload.accountId,
-        threadId: payload.threadId,
-        messageId: payload.messageId
+        threadId: openInbox ? '' : (payload.threadId || ''),
+        messageId: openInbox ? undefined : payload.messageId
       })
     }
 
