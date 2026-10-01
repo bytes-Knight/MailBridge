@@ -203,6 +203,13 @@ export function App(): React.ReactElement {
 
   return (
     <div className="app-layout">
+      <div className="app-bg" aria-hidden="true">
+        <div className="app-bg-orb app-bg-orb--a" />
+        <div className="app-bg-orb app-bg-orb--b" />
+        <div className="app-bg-orb app-bg-orb--c" />
+        <div className="app-bg-grid" />
+        <div className="app-bg-vignette" />
+      </div>
       <TitleBar
         viewLabel={getViewLabel()}
         onDashboard={handleBackToDashboard}
